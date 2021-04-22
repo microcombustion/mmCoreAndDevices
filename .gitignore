@@ -17,6 +17,7 @@ tags
 *.sdf
 *.suo
 *.user
+*.json
 ipch/
 .vs/
 .vscode/
