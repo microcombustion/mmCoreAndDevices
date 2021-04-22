@@ -33,7 +33,7 @@
 #include "SapClassBasic.h"
 #include "../MMDevice/ModuleInterface.h"
 #include <string>
-#include <functional>
+#include <iterator>
 
 //////////////////////////////////////////////////////////////////////////////
 // Error codes
@@ -45,21 +45,13 @@ class SequenceThread;
 const char* g_CameraDeviceName = "Sapera GigE camera adapter";
 const char* g_CameraServer = "AcquisitionDevice";
 
-std::map< SapFeature::Type, MM::PropertyType > featureType = {
-    {SapFeature::TypeString, MM::String},
-    {SapFeature::TypeEnum, MM::String},
-    {SapFeature::TypeInt32, MM::Integer},
-    {SapFeature::TypeFloat, MM::Float},
-    {SapFeature::TypeDouble, MM::Float},
-    {SapFeature::TypeUndefined, MM::String}
-};
-
 std::wstring s2ws(const std::string&);
 int ErrorBox(std::string text, std::string caption);
 
 class SaperaGigE : public CCameraBase<SaperaGigE>
 {
 private:
+
     struct feature
     {
         char* name;
@@ -67,40 +59,10 @@ private:
         CPropertyAction* action;
     };
 
-    const std::map< const char*, feature > deviceFeatures = {
-        // information on device - use names shown in Sapera CamExpert
-        {MM::g_Keyword_PixelType, {"PixelFormat", false, new CPropertyAction(this, &SaperaGigE::OnPixelType)}},
-        {MM::g_Keyword_Exposure, {"ExposureTime", false, new CPropertyAction(this, &SaperaGigE::OnExposure)}},
-        {MM::g_Keyword_Gain, {"Gain", false, new CPropertyAction(this, &SaperaGigE::OnGain)}},
-        {"CameraVendor", {"DeviceVendorName", true, NULL}},
-        {"CameraFamily", {"DeviceFamilyName", true, NULL}},
-        {MM::g_Keyword_CameraName, {"DeviceModelName", true, NULL}},
-        {"CameraVersion", {"DeviceVersion", true, NULL}},
-        {"CameraInfo", {"DeviceManufacturerInfo", true, NULL}},
-        {"CameraPartNumber", {"deviceManufacturerPartNumber", true, NULL}},
-        {"CameraFirmwareVersion", {"DeviceFirmwareVersion", true, NULL}},
-        {"CameraSerialNumber", {"DeviceSerialNumber", true, NULL}},
-        {MM::g_Keyword_CameraID, {"DeviceUserID", true, NULL}},
-        {"CameraMacAddress", {"deviceMacAddress", true, NULL}},
-        {"SensorColorType", {"sensorColorType", true, NULL}},
-        {"SensorPixelCoding", {"PixelCoding", true, NULL}},
-        {"SensorBlackLevel", {"BlackLevel", true, NULL}},
-        {"SensorPixelInput", {"pixelSizeInput", true, NULL}},
-        {"SensorShutterMode", {"SensorShutterMode", false, NULL}},
-        {"SensorBinningMode", {"binningMode", false, new CPropertyAction(this, &SaperaGigE::OnBinningMode)}},
-        {"SensorWidth", {"SensorWidth", true, NULL}},
-        {"SensorHeight", {"SensorHeight", true, NULL}},
-        {"ImagePixelSize", {"PixelSize", true, new CPropertyAction(this, &SaperaGigE::OnPixelSize)}},
-        {"ImageHorizontalOffset", {"OffsetX", false, new CPropertyAction(this, &SaperaGigE::OnOffsetX)}},
-        {"ImageVerticalOffset", {"OffsetY", false, new CPropertyAction(this, &SaperaGigE::OnOffsetY)}},
-        {"ImageWidth", {"Width", false, new CPropertyAction(this, &SaperaGigE::OnWidth)}},
-        {"ImageHeight", {"Height", false, new CPropertyAction(this, &SaperaGigE::OnHeight)}},
-        {"ImageTimeout", {"ImageTimeout", false, new CPropertyAction(this, &SaperaGigE::OnImageTimeout)}},
-        {"TurboTransferEnable", {"turboTransferEnable", true, NULL}},
-        {"SensorTemperature", {"DeviceTemperature", true, new CPropertyAction(this, &SaperaGigE::OnTemperature)}},
-        //{"ReverseX", {"ReverseX", true, NULL}},
-        //{MM::g_Keyword_Transpose_MirrorY, {"ReverseY", true, NULL}},
-    };
+    feature define_feature(char* name, bool readOnly, CPropertyAction* action) {
+        feature out = { name, readOnly, action };
+        return out;
+    }
 
 public:
     SaperaGigE();
