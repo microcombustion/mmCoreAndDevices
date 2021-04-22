@@ -391,6 +391,7 @@ int SaperaGigE::SnapImage()
     Xfer_->SetCommandTimeout(1000);
     if (!Xfer_->Snap(1))
     {
+        LogMessage("Failure occurred while capturing a single image");
         return DEVICE_ERR;
     }
     // Wait for either the capture to finish or 2.5 seconds, whichever is first
@@ -584,7 +585,7 @@ int SaperaGigE::SetBinning(int binF)
 int SaperaGigE::StopSequenceAcquisition()
 {
     //@TODO: Implement Sequence Acquisition
-    return DEVICE_ERR;
+    return DEVICE_NOT_YET_IMPLEMENTED;
     /*thd_->Stop();
     thd_->wait();
     sequenceRunning_ = false;
@@ -599,7 +600,7 @@ int SaperaGigE::StopSequenceAcquisition()
 int SaperaGigE::StartSequenceAcquisition(long numImages, double interval_ms, bool stopOnOverflow)
 {
     //@TODO: Implement Sequence Acquisition
-    return DEVICE_ERR;
+    return DEVICE_NOT_YET_IMPLEMENTED;
     /*if (sequenceRunning_)
     {
         return DEVICE_CAMERA_BUSY_ACQUIRING;
@@ -813,7 +814,10 @@ int SaperaGigE::OnTemperature(MM::PropertyBase* pProp, MM::ActionType eAct)
     {
         double value;
         if (!AcqDevice_.GetFeatureValue("DeviceTemperature", &value))
+        {
+            LogMessage("Failed to get feature value for 'DeviceTemperature'");
             return DEVICE_ERR;
+        }
         pProp->Set(value);
     }
     return DEVICE_OK;
@@ -856,11 +860,19 @@ int SaperaGigE::OnGain(MM::PropertyBase* pProp, MM::ActionType eAct)
     if (eAct == MM::AfterSet)
     {
         pProp->Get(gain);
-        AcqDevice_.SetFeatureValue("Gain", gain);
+        if (!AcqDevice_.SetFeatureValue("Gain", gain))
+        {
+            LogMessage("Failed to set feature value for 'Gain'");
+            return DEVICE_ERR;
+        }
     }
     else if (eAct == MM::BeforeGet)
     {
-        AcqDevice_.GetFeatureValue("Gain", &gain);
+        if (!AcqDevice_.GetFeatureValue("Gain", &gain))
+        {
+            LogMessage("Failed to get feature value for 'Gain'");
+            return DEVICE_ERR;
+        }
         pProp->Set(gain);
     }
 
@@ -870,22 +882,24 @@ int SaperaGigE::OnGain(MM::PropertyBase* pProp, MM::ActionType eAct)
 int SaperaGigE::OnExposure(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
     // note that GigE units of exposure are us; umanager uses ms
+    double exposure;
     if (eAct == MM::AfterSet)
     {
-        double oldd = 0, newd = 0;
-        AcqDevice_.GetFeatureValue("ExposureTime", &oldd); // us
-        pProp->Get(newd);  // ms
-        if (!AcqDevice_.SetFeatureValue("ExposureTime", newd * 1000.0)) // ms to us
+        pProp->Get(exposure);  // ms
+        if (!AcqDevice_.SetFeatureValue("ExposureTime", exposure * 1000.0)) // ms to us
         {
-            pProp->Set(oldd / 1000.0);  // us to ms
-            return DEVICE_INVALID_PROPERTY_VALUE;
+            LogMessage("Failed to set feature value for 'ExposureTime'");
+            return DEVICE_ERR;
         }
     }
     else if (eAct == MM::BeforeGet)
     {
-        double d = 0;
-        if (AcqDevice_.GetFeatureValue("ExposureTime", &d)) // us
-            pProp->Set(d / 1000.0);
+        if (!AcqDevice_.GetFeatureValue("ExposureTime", &exposure)) // us
+        {
+            LogMessage("Failed to get feature value for 'ExposureTime'");
+            return DEVICE_ERR;
+        }
+        pProp->Set(exposure / 1000.0);
     }
     return DEVICE_OK;
 }
