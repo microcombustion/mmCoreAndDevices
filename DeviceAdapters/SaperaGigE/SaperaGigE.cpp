@@ -394,8 +394,8 @@ int SaperaGigE::SnapImage()
         LogMessage("Failure occurred while capturing a single image");
         return DEVICE_ERR;
     }
-    // Wait for either the capture to finish or 2.5 seconds, whichever is first
-    if (!Xfer_->Wait(2500))
+    // Wait for either the capture to finish or 16 seconds, whichever is first
+    if (!Xfer_->Wait(16000))
     {
         return DEVICE_ERR;
     }
