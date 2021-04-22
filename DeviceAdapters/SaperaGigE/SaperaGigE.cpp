@@ -207,13 +207,68 @@ int SaperaGigE::Initialize()
     if (ret != DEVICE_OK)
         return ret;
 
+    // set up feature type correspondence
+    std::map<SapFeature::Type, MM::PropertyType> featureTypes;
+
+    featureTypes[SapFeature::TypeString] = MM::String;
+    featureTypes[SapFeature::TypeEnum] = MM::String;
+    featureTypes[SapFeature::TypeInt32] = MM::Integer;
+    featureTypes[SapFeature::TypeFloat] = MM::Float;
+    featureTypes[SapFeature::TypeDouble] = MM::Float;
+    featureTypes[SapFeature::TypeUndefined] = MM::String;
+
     // set property list
     // -----------------
 
+    std::map< const char*, feature > deviceFeatures;
+
+    deviceFeatures[MM::g_Keyword_PixelType] = define_feature( "PixelFormat", false,
+         new CPropertyAction(this, &SaperaGigE::OnPixelType) );
+    deviceFeatures[MM::g_Keyword_Exposure] = define_feature( "ExposureTime", false,
+        new CPropertyAction(this, &SaperaGigE::OnExposure) );
+    deviceFeatures[MM::g_Keyword_Gain] = define_feature( "Gain", false,
+        new CPropertyAction(this, &SaperaGigE::OnGain) );
+    deviceFeatures["CameraVendor"] = define_feature( "DeviceVendorName", true, NULL );
+    deviceFeatures["CameraFamily"] = define_feature( "DeviceFamilyName", true, NULL );
+    deviceFeatures[MM::g_Keyword_CameraName] = define_feature( "DeviceModelName", true, NULL );
+    deviceFeatures["CameraVersion"] = define_feature( "DeviceVersion", true, NULL );
+    deviceFeatures["CameraInfo"] = define_feature( "DeviceManufacturerInfo", true, NULL );
+    deviceFeatures["CameraPartNumber"] = define_feature( "deviceManufacturerPartNumber", true, NULL );
+    deviceFeatures["CameraFirmwareVersion"] = define_feature( "DeviceFirmwareVersion", true, NULL );
+    deviceFeatures["CameraSerialNumber"] = define_feature( "DeviceSerialNumber", true, NULL );
+    deviceFeatures[MM::g_Keyword_CameraID] = define_feature( "DeviceUserID", true, NULL );
+    deviceFeatures["CameraMacAddress"] = define_feature( "deviceMacAddress", true, NULL );
+    deviceFeatures["SensorColorType"] = define_feature( "sensorColorType", true, NULL );
+    deviceFeatures["SensorPixelCoding"] = define_feature( "PixelCoding", true, NULL );
+    deviceFeatures["SensorBlackLevel"] = define_feature( "BlackLevel", true, NULL );
+    deviceFeatures["SensorPixelInput"] = define_feature( "pixelSizeInput", true, NULL );
+    deviceFeatures["SensorShutterMode"] = define_feature( "SensorShutterMode", false, NULL );
+    deviceFeatures["SensorBinningMode"] = define_feature( "binningMode", false,
+        new CPropertyAction(this, &SaperaGigE::OnBinningMode) );
+    deviceFeatures["SensorWidth"] = define_feature( "SensorWidth", true, NULL );
+    deviceFeatures["SensorHeight"] = define_feature( "SensorHeight", true, NULL );
+    deviceFeatures["ImagePixelSize"] = define_feature( "PixelSize", true,
+        new CPropertyAction(this, &SaperaGigE::OnPixelSize) );
+    deviceFeatures["ImageHorizontalOffset"] = define_feature( "OffsetX", false,
+        new CPropertyAction(this, &SaperaGigE::OnOffsetX) );
+    deviceFeatures["ImageVerticalOffset"] = define_feature( "OffsetY", false,
+        new CPropertyAction(this, &SaperaGigE::OnOffsetY) );
+    deviceFeatures["ImageWidth"] = define_feature( "Width", false,
+        new CPropertyAction(this, &SaperaGigE::OnWidth) );
+    deviceFeatures["ImageHeight"] = define_feature( "Height", false,
+        new CPropertyAction(this, &SaperaGigE::OnHeight) );
+    deviceFeatures["ImageTimeout"] = define_feature( "ImageTimeout", false,
+        new CPropertyAction(this, &SaperaGigE::OnImageTimeout) );
+    deviceFeatures["TurboTransferEnable"] = define_feature( "turboTransferEnable", true, NULL );
+    deviceFeatures["SensorTemperature"] = define_feature( "DeviceTemperature", true,
+        new CPropertyAction(this, &SaperaGigE::OnTemperature) );
+
     // device features
-    for (auto const& x : deviceFeatures)
+    //for (auto const& x : deviceFeatures)
+    std::map< const char*, feature >::iterator x;
+    for (x = deviceFeatures.begin(); x != deviceFeatures.end(); x++)
     {
-        feature f = x.second;
+        feature f = x->second;
         BOOL isAvailable;
         AcqDevice_.IsFeatureAvailable(f.name, &isAvailable);
         if (!isAvailable)
@@ -224,7 +279,7 @@ int SaperaGigE::Initialize()
         }
 
         LogMessage((std::string) "Adding feature '" + f.name
-            + "' as property '" + x.first + "'");
+            + "' as property '" + x->first + "'");
         char value[MM::MaxStrLength];
         if (!AcqDevice_.GetFeatureValue(f.name, value, sizeof(value)))
             return DEVICE_ERR;
@@ -233,17 +288,17 @@ int SaperaGigE::Initialize()
         SapFeature::Type sapType;
         AcqFeature_.GetType(&sapType);
         std::map< SapFeature::Type, MM::PropertyType>::iterator it;
-        it = featureType.find(sapType);
+        it = featureTypes.find(sapType);
         MM::PropertyType eType;
-        if (it == featureType.end())
+        if (it == featureTypes.end())
             eType = MM::String;
         else
             eType = it->second;
 
         if (f.action == NULL)
-            ret = CreateProperty(x.first, value, eType, f.readOnly);
+            ret = CreateProperty(x->first, value, eType, f.readOnly);
         else
-            ret = CreateProperty(x.first, value, eType, f.readOnly, f.action);
+            ret = CreateProperty(x->first, value, eType, f.readOnly, f.action);
         assert(ret == DEVICE_OK);
 
         if (sapType == SapFeature::TypeEnum)
@@ -256,7 +311,7 @@ int SaperaGigE::Initialize()
                 AcqFeature_.GetEnumString(i, value, sizeof(value));
                 allowed.push_back(value);
             }
-            ret = SetAllowedValues(x.first, allowed);
+            ret = SetAllowedValues(x->first, allowed);
             assert(ret == DEVICE_OK);
         }
     }
@@ -627,7 +682,7 @@ int SaperaGigE::OnPixelSize(MM::PropertyBase* pProp, MM::ActionType eAct)
 
 long SaperaGigE::CheckValue(const char* key, long value)
 {
-    int64_t min, max, inc;
+    INT64 min, max, inc;
     AcqDevice_.GetFeatureInfo(key, &AcqFeature_);
     AcqFeature_.GetInc(&inc);
     AcqFeature_.GetMin(&min);
@@ -638,7 +693,7 @@ long SaperaGigE::CheckValue(const char* key, long value)
 
     if (value != out)
         LogMessage((std::string) "Encountered invalid value for '" + key
-            + "': corrected " + std::to_string(value) + " to " + std::to_string(out));
+            + "': corrected " + std::to_string((INT64) value) + " to " + std::to_string((INT64) out));
     return out;
 }
 
@@ -925,7 +980,7 @@ void SaperaGigE::XferCallback(SapXferCallbackInfo* pInfo)
     if (pInfo->IsTrash())
     {
         ErrorBox((std::string) "Frames acquired in trash buffer: " 
-            + std::to_string(pInfo->GetEventCount()), "Xfer");
+            + std::to_string((INT64) pInfo->GetEventCount()), "Xfer");
     }
 }
 
@@ -953,7 +1008,7 @@ int SaperaGigE::SetUpBinningProperties()
     if (DEVICE_OK != ret)
         return ret;
 
-    int64_t bin, min, max, inc;
+    INT64 bin, min, max, inc;
     std::vector<std::string> vValues, hValues, binValues;
 
     // vertical binning
@@ -967,7 +1022,7 @@ int SaperaGigE::SetUpBinningProperties()
     AcqFeature_.GetMin(&min);
     AcqFeature_.GetMax(&max);
     AcqFeature_.GetInc(&inc);
-    for (int64_t i = min; i <= max; i += inc)
+    for (INT64 i = min; i <= max; i += inc)
         vValues.push_back(std::to_string(i));
 
     // horizontal binning
@@ -981,7 +1036,7 @@ int SaperaGigE::SetUpBinningProperties()
     AcqFeature_.GetMin(&min);
     AcqFeature_.GetMax(&max);
     AcqFeature_.GetInc(&inc);
-    for (int64_t i = min; i <= max; i += inc)
+    for (INT64 i = min; i <= max; i += inc)
         hValues.push_back(std::to_string(i));
 
     // possible uniform binning values.
