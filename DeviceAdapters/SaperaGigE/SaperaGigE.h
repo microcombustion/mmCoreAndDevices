@@ -34,6 +34,7 @@
 #include "../MMDevice/ModuleInterface.h"
 #include <string>
 #include <iterator>
+#include <map>
 
 //////////////////////////////////////////////////////////////////////////////
 // Error codes
@@ -122,6 +123,8 @@ public:
     int OnPixelType(MM::PropertyBase* pProp, MM::ActionType eAct);
     int OnGain(MM::PropertyBase* pProp, MM::ActionType eAct);
     int OnExposure(MM::PropertyBase* pProp, MM::ActionType eAct);
+    int OnCamera(MM::PropertyBase* pProp, MM::ActionType eAct);//for multiple camera support
+    int OnCameraName(MM::PropertyBase* pProp, MM::ActionType eAct);
 
 private:
 
@@ -142,7 +145,11 @@ private:
     std::vector<std::string> acqDeviceList_;
     std::string activeDevice_;
 
+    int NumberOfAvailableCameras_;
+    int NumberOfWorkableCameras_;
+    int GetListOfAvailableCameras();
     SapAcqDevice AcqDevice_;
+    SapAcqDevice CurrentDevice_;
     SapBufferWithTrash Buffers_;
     SapBufferRoi* Roi_;
     SapTransfer AcqToBuf_;
