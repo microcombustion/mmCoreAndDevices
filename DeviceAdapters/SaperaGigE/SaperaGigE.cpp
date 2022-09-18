@@ -98,41 +98,12 @@ SaperaGigE::SaperaGigE() :
     sequenceRunning_(false),
     Roi_(NULL)
 {
+
     // call the base class method to set-up default error codes/messages
     InitializeDefaultErrorMessages();
 
-    CreateProperty(MM::g_Keyword_Name, g_CameraDeviceName, MM::String, true);
-
-    // Sapera++ library stuff
-    if (!(SapManager::DetectAllServers(SapManager::DetectServerAll)))
-    {
-        LogMessage("No CameraLink camera servers detected", false);
-        activeDevice_ = "";
-        return;
-    }
-
-    int serverCount = SapManager::GetServerCount();
-    char serverName[CORSERVER_MAX_STRLEN];
-    for (int serverIndex = 0; serverIndex < serverCount; serverIndex++)
-    {
-        if (SapManager::GetResourceCount(serverIndex, SapManager::ResourceAcqDevice) != 0)
-        {
-            // Get Server Name Value
-            SapManager::GetServerName(serverIndex, serverName, sizeof(serverName));
-            acqDeviceList_.push_back(serverName);
-        }
-    }
-
-    if (acqDeviceList_.size() == 0)
-    {
-        activeDevice_ = "";
-        return;
-    }
-
-    // add available servers to property and set active device to first server in the list
-    CreateProperty(g_CameraServer, acqDeviceList_[0].c_str(), MM::String, false, 0, false);
-    SetAllowedValues(g_CameraServer, acqDeviceList_);
-    activeDevice_ = acqDeviceList_[0];
+    if (GetListOfAvailableCameras() != DEVICE_OK)
+        LogMessage("No Sapera camera found!", false);
 }
 
 /**
@@ -146,6 +117,48 @@ SaperaGigE::~SaperaGigE()
 {
     if (initialized_)
         Shutdown();
+
+    NumberOfWorkableCameras_ = 0;
+}
+
+int SaperaGigE::GetListOfAvailableCameras()
+
+{
+    CreateProperty(MM::g_Keyword_Name, g_CameraDeviceName, MM::String, true);
+
+    // Sapera++ library stuff
+    if (!(SapManager::DetectAllServers(SapManager::DetectServerAll)))
+    {
+        LogMessage("No CameraLink camera servers detected", false);
+        return DEVICE_NOT_CONNECTED;
+    }
+
+    acqDeviceList_.clear();
+    NumberOfAvailableCameras_ = SapManager::GetServerCount();
+    char serverName[CORSERVER_MAX_STRLEN];
+    for (int serverIndex = 0; serverIndex < NumberOfAvailableCameras_; serverIndex++)
+    {
+        if (SapManager::GetResourceCount(serverIndex, SapManager::ResourceAcqDevice) != 0)
+        {
+            // Get Server Name Value
+            SapManager::GetServerName(serverIndex, serverName, sizeof(serverName));
+            acqDeviceList_.push_back(serverName);
+        }
+    }
+
+    if (acqDeviceList_.size() == 0)
+    {
+        return DEVICE_NOT_CONNECTED;
+    }
+    else {
+        // add available servers to property and set active device to first server in the list
+        CPropertyAction* pAct = new CPropertyAction(this, &SaperaGigE::OnCamera);
+        int nRet = CreateProperty(g_CameraServer, acqDeviceList_[0].c_str(), MM::String, false, pAct, true);
+        assert(nRet == DEVICE_OK);
+        nRet = SetAllowedValues(g_CameraServer, acqDeviceList_);
+        return DEVICE_OK;
+        
+    }
 }
 
 /**
@@ -160,6 +173,49 @@ void SaperaGigE::GetName(char* name) const
 }
 
 /**
+  * Set camera
+  */
+int SaperaGigE::OnCamera(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+    if (eAct == MM::AfterSet)
+    {
+        string CameraName;
+        pProp->Get(CameraName);
+
+        for (auto servername : acqDeviceList_) {
+
+            if (servername.compare(CameraName) == 0) 
+            {
+                initialized_ = false;
+                activeDevice_ = CameraName;
+                return DEVICE_OK;
+            }
+
+        }
+        assert(!"Unrecognized Camera");
+    }
+    else if (eAct == MM::BeforeGet) {
+        // Empty path
+    }
+    return DEVICE_OK;
+}
+
+/**
+   * Camera Name
+   */
+int SaperaGigE::OnCameraName(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+    if (eAct == MM::AfterSet)
+    {
+    }
+    else if (eAct == MM::BeforeGet)
+    {
+        pProp->Set(activeDevice_.c_str());
+    }
+    return DEVICE_OK;
+}
+
+/**
 * Intializes the hardware.
 * Typically we access and initialize hardware at this point.
 * Device properties are typically created here as well.
@@ -169,15 +225,13 @@ int SaperaGigE::Initialize()
 {
     if (initialized_)
         return DEVICE_OK;
-    if (activeDevice_.size() == 0)
-        return DEVICE_NOT_CONNECTED;
 
+    //CPropertyAction* pAct;
     int ret;
-
     // create live video thread
     thd_ = new SequenceThread(this);
 
-    LogMessage((std::string) "Initialize device '" + activeDevice_ + "'");
+    LogMessage((std::string)"Initialize device '" + activeDevice_ + "'");
     SapLocation loc_(activeDevice_.c_str());
     AcqDevice_ = SapAcqDevice(loc_, false);
     if (!AcqDevice_.Create())
@@ -196,16 +250,7 @@ int SaperaGigE::Initialize()
         return DEVICE_NATIVE_MODULE_FAILED;
     }
 
-    // binning
-    ret = SetUpBinningProperties();
-    if (ret != DEVICE_OK)
-        return ret;
-
-    // set up Sapera / Micro-Manager buffers
-    LogMessage((std::string) "Setting up buffers");
-    ret = SynchronizeBuffers();
-    if (ret != DEVICE_OK)
-        return ret;
+    NumberOfWorkableCameras_++;
 
     // set up feature type correspondence
     std::map<SapFeature::Type, MM::PropertyType> featureTypes;
@@ -222,46 +267,47 @@ int SaperaGigE::Initialize()
 
     std::map< const char*, feature > deviceFeatures;
 
-    deviceFeatures[MM::g_Keyword_PixelType] = define_feature( "PixelFormat", false,
-         new CPropertyAction(this, &SaperaGigE::OnPixelType) );
-    deviceFeatures[MM::g_Keyword_Exposure] = define_feature( "ExposureTime", false,
-        new CPropertyAction(this, &SaperaGigE::OnExposure) );
-    deviceFeatures[MM::g_Keyword_Gain] = define_feature( "Gain", false,
-        new CPropertyAction(this, &SaperaGigE::OnGain) );
-    deviceFeatures["CameraVendor"] = define_feature( "DeviceVendorName", true, NULL );
-    deviceFeatures["CameraFamily"] = define_feature( "DeviceFamilyName", true, NULL );
-    deviceFeatures[MM::g_Keyword_CameraName] = define_feature( "DeviceModelName", true, NULL );
-    deviceFeatures["CameraVersion"] = define_feature( "DeviceVersion", true, NULL );
-    deviceFeatures["CameraInfo"] = define_feature( "DeviceManufacturerInfo", true, NULL );
-    deviceFeatures["CameraPartNumber"] = define_feature( "deviceManufacturerPartNumber", true, NULL );
-    deviceFeatures["CameraFirmwareVersion"] = define_feature( "DeviceFirmwareVersion", true, NULL );
-    deviceFeatures["CameraSerialNumber"] = define_feature( "DeviceSerialNumber", true, NULL );
-    deviceFeatures[MM::g_Keyword_CameraID] = define_feature( "DeviceUserID", true, NULL );
-    deviceFeatures["CameraMacAddress"] = define_feature( "deviceMacAddress", true, NULL );
-    deviceFeatures["SensorColorType"] = define_feature( "sensorColorType", true, NULL );
-    deviceFeatures["SensorPixelCoding"] = define_feature( "PixelCoding", true, NULL );
-    deviceFeatures["SensorBlackLevel"] = define_feature( "BlackLevel", true, NULL );
-    deviceFeatures["SensorPixelInput"] = define_feature( "pixelSizeInput", true, NULL );
-    deviceFeatures["SensorShutterMode"] = define_feature( "SensorShutterMode", false, NULL );
-    deviceFeatures["SensorBinningMode"] = define_feature( "binningMode", false,
-        new CPropertyAction(this, &SaperaGigE::OnBinningMode) );
-    deviceFeatures["SensorWidth"] = define_feature( "SensorWidth", true, NULL );
-    deviceFeatures["SensorHeight"] = define_feature( "SensorHeight", true, NULL );
-    deviceFeatures["ImagePixelSize"] = define_feature( "PixelSize", true,
-        new CPropertyAction(this, &SaperaGigE::OnPixelSize) );
-    deviceFeatures["ImageHorizontalOffset"] = define_feature( "OffsetX", false,
-        new CPropertyAction(this, &SaperaGigE::OnOffsetX) );
-    deviceFeatures["ImageVerticalOffset"] = define_feature( "OffsetY", false,
-        new CPropertyAction(this, &SaperaGigE::OnOffsetY) );
-    deviceFeatures["ImageWidth"] = define_feature( "Width", false,
-        new CPropertyAction(this, &SaperaGigE::OnWidth) );
-    deviceFeatures["ImageHeight"] = define_feature( "Height", false,
-        new CPropertyAction(this, &SaperaGigE::OnHeight) );
-    deviceFeatures["ImageTimeout"] = define_feature( "ImageTimeout", false,
-        new CPropertyAction(this, &SaperaGigE::OnImageTimeout) );
-    deviceFeatures["TurboTransferEnable"] = define_feature( "turboTransferEnable", true, NULL );
-    deviceFeatures["SensorTemperature"] = define_feature( "DeviceTemperature", true,
-        new CPropertyAction(this, &SaperaGigE::OnTemperature) );
+    deviceFeatures[MM::g_Keyword_PixelType] = define_feature("PixelFormat", false,
+        new CPropertyAction(this, &SaperaGigE::OnPixelType));
+    deviceFeatures[MM::g_Keyword_Exposure] = define_feature("ExposureTime", false,
+        new CPropertyAction(this, &SaperaGigE::OnExposure));
+    deviceFeatures[MM::g_Keyword_Gain] = define_feature("Gain", false,
+        new CPropertyAction(this, &SaperaGigE::OnGain));
+    deviceFeatures["CameraVendor"] = define_feature("DeviceVendorName", true, NULL);
+    deviceFeatures["CameraFamily"] = define_feature("DeviceFamilyName", true, NULL);
+    deviceFeatures[MM::g_Keyword_CameraName] = define_feature("DeviceModelName", true, NULL);
+    deviceFeatures["CameraVersion"] = define_feature("DeviceVersion", true, NULL);
+    deviceFeatures["CameraInfo"] = define_feature("DeviceManufacturerInfo", true, NULL);
+    deviceFeatures["CameraPartNumber"] = define_feature("deviceManufacturerPartNumber", true, NULL);
+    deviceFeatures["CameraFirmwareVersion"] = define_feature("DeviceFirmwareVersion", true, NULL);
+    deviceFeatures["CameraSerialNumber"] = define_feature("DeviceSerialNumber", true, NULL);
+    deviceFeatures[MM::g_Keyword_CameraID] = define_feature("DeviceUserID", true, NULL);
+    deviceFeatures["CameraMacAddress"] = define_feature("deviceMacAddress", true, NULL);
+    deviceFeatures["SensorColorType"] = define_feature("sensorColorType", true, NULL);
+    deviceFeatures["SensorPixelCoding"] = define_feature("PixelCoding", true, NULL);
+    deviceFeatures["SensorBlackLevel"] = define_feature("BlackLevel", true, NULL);
+    deviceFeatures["SensorPixelInput"] = define_feature("pixelSizeInput", true, NULL);
+    deviceFeatures["SensorShutterMode"] = define_feature("SensorShutterMode", false, NULL);
+    deviceFeatures["SensorBinningMode"] = define_feature("binningMode", false,
+        new CPropertyAction(this, &SaperaGigE::OnBinningMode));
+    deviceFeatures["SensorWidth"] = define_feature("SensorWidth", true, NULL);
+    deviceFeatures["SensorHeight"] = define_feature("SensorHeight", true, NULL);
+    deviceFeatures["ImagePixelSize"] = define_feature("PixelSize", true,
+        new CPropertyAction(this, &SaperaGigE::OnPixelSize));
+    deviceFeatures["ImageHorizontalOffset"] = define_feature("OffsetX", false,
+        new CPropertyAction(this, &SaperaGigE::OnOffsetX));
+    deviceFeatures["ImageVerticalOffset"] = define_feature("OffsetY", false,
+        new CPropertyAction(this, &SaperaGigE::OnOffsetY));
+    deviceFeatures["ImageWidth"] = define_feature("Width", false,
+        new CPropertyAction(this, &SaperaGigE::OnWidth));
+    deviceFeatures["ImageHeight"] = define_feature("Height", false,
+        new CPropertyAction(this, &SaperaGigE::OnHeight));
+    deviceFeatures["ImageTimeout"] = define_feature("ImageTimeout", false,
+        new CPropertyAction(this, &SaperaGigE::OnImageTimeout));
+    deviceFeatures["TurboTransferEnable"] = define_feature("turboTransferEnable", true, NULL);
+    deviceFeatures["SensorTemperature"] = define_feature("DeviceTemperature", true,
+        new CPropertyAction(this, &SaperaGigE::OnTemperature));
+
 
     // device features
     //for (auto const& x : deviceFeatures)
@@ -273,12 +319,12 @@ int SaperaGigE::Initialize()
         AcqDevice_.IsFeatureAvailable(f.name, &isAvailable);
         if (!isAvailable)
         {
-            LogMessage((std::string) "Feature '" + f.name
+            LogMessage((std::string)"Feature '" + f.name
                 + "' is not supported");
             continue;
         }
 
-        LogMessage((std::string) "Adding feature '" + f.name
+        LogMessage((std::string)"Adding feature '" + f.name
             + "' as property '" + x->first + "'");
         char value[MM::MaxStrLength];
         if (!AcqDevice_.GetFeatureValue(f.name, value, sizeof(value)))
@@ -316,6 +362,17 @@ int SaperaGigE::Initialize()
         }
     }
 
+    // binning
+    ret = SetUpBinningProperties();
+    if (ret != DEVICE_OK)
+        return ret;
+
+    // set up Sapera / Micro-Manager buffers
+    LogMessage((std::string) "Setting up buffers");
+    ret = SynchronizeBuffers();
+    if (ret != DEVICE_OK)
+        return ret;
+
     double low = 0.0;
     double high = 0.0;
 
@@ -351,7 +408,7 @@ int SaperaGigE::Shutdown()
 {
     if (!initialized_)
         return DEVICE_OK;
-    LogMessage((std::string) "Shutting down device '" + loc_.GetServerName() + "'");
+    LogMessage((std::string)"Shutting down device '" + loc_.GetServerName() + "'");
 
     initialized_ = false;
     Xfer_->Freeze();
@@ -369,7 +426,7 @@ int SaperaGigE::Shutdown()
 */
 int SaperaGigE::FreeHandles()
 {
-    LogMessage((std::string) "Destroy Sapera buffers and devices");
+    LogMessage((std::string)"Destroy Sapera buffers and devices");
     if (Xfer_ && *Xfer_ && !Xfer_->Destroy()) return DEVICE_ERR;
     if (!Buffers_.Destroy()) return DEVICE_ERR;
     if (!AcqFeature_.Destroy()) return DEVICE_ERR;
@@ -401,6 +458,8 @@ int SaperaGigE::SnapImage()
     }
     return DEVICE_OK;
 }
+
+
 
 /**
 * Returns pixel data.
@@ -484,7 +543,7 @@ long SaperaGigE::GetImageBufferSize() const
 */
 int SaperaGigE::SetROI(unsigned x, unsigned y, unsigned xSize, unsigned ySize)
 {
-    LogMessage((std::string) "Setting Region of Interest");
+    LogMessage((std::string)"Setting Region of Interest");
     if (xSize == 0 && ySize == 0)
         return ClearROI();
     else
@@ -693,8 +752,8 @@ long SaperaGigE::CheckValue(const char* key, long value)
     out = max((long)min, min((long)max, out));
 
     if (value != out)
-        LogMessage((std::string) "Encountered invalid value for '" + key
-            + "': corrected " + std::to_string((INT64) value) + " to " + std::to_string((INT64) out));
+        LogMessage((std::string)"Encountered invalid value for '" + key
+            + "': corrected " + std::to_string((INT64)value) + " to " + std::to_string((INT64)out));
     return out;
 }
 
@@ -993,8 +1052,8 @@ void SaperaGigE::XferCallback(SapXferCallbackInfo* pInfo)
     // If grabbing in trash buffer, log a message
     if (pInfo->IsTrash())
     {
-        ErrorBox((std::string) "Frames acquired in trash buffer: " 
-            + std::to_string((INT64) pInfo->GetEventCount()), "Xfer");
+        ErrorBox((std::string)"Frames acquired in trash buffer: "
+            + std::to_string((INT64)pInfo->GetEventCount()), "Xfer");
     }
 }
 
@@ -1016,7 +1075,7 @@ int SaperaGigE::SetUpBinningProperties()
 
     // note that the GenICam spec separates vertical and horizontal binning and does
     // not provide a single, unified binning property.
-    LogMessage((std::string) "Set up binning properties");
+    LogMessage((std::string)"Set up binning properties");
     CPropertyAction* pAct = new CPropertyAction(this, &SaperaGigE::OnBinning);
     int ret = CreateProperty(MM::g_Keyword_Binning, "1", MM::Integer, false, pAct);
     if (DEVICE_OK != ret)
@@ -1028,7 +1087,7 @@ int SaperaGigE::SetUpBinningProperties()
     // vertical binning
     if (!AcqDevice_.SetFeatureValue("BinningVertical", 1))
     {
-        LogMessage((std::string) "Failed to set 'BinningVertical'");
+        LogMessage((std::string)"Failed to set 'BinningVertical'");
         return DEVICE_INVALID_PROPERTY;
     }
     AcqDevice_.GetFeatureValue("BinningVertical", &bin);
@@ -1042,7 +1101,7 @@ int SaperaGigE::SetUpBinningProperties()
     // horizontal binning
     if (!AcqDevice_.SetFeatureValue("BinningHorizontal", 1))
     {
-        LogMessage((std::string) "Failed to set 'BinningHorizontal'");
+        LogMessage((std::string)"Failed to set 'BinningHorizontal'");
         return DEVICE_INVALID_PROPERTY;
     }
     AcqDevice_.GetFeatureValue("BinningHorizontal", &bin);
