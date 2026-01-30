@@ -25,6 +25,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <iomanip>
 
 #include "AlliedVisionHub.h"
 #include "ModuleInterface.h"
@@ -101,6 +102,7 @@ AlliedVisionCamera::AlliedVisionCamera(const char *deviceName) :
     m_cameraName{ deviceName },
     m_frames{},
     m_buffer{},
+    m_snapFrame{},
     m_bufferSize{ 0 },
     m_payloadSize{ 0 },
     m_isAcquisitionRunning{ false },
@@ -232,12 +234,25 @@ VmbError_t AlliedVisionCamera::resizeImageBuffer()
         return err;
     }
 
-    m_bufferSize = std::max(GetImageWidth() * GetImageHeight() * m_currentPixelFormat.getBytesPerPixel(), m_payloadSize);
+    VmbUint32_t newBufferSize = std::max(GetImageWidth() * GetImageHeight() * m_currentPixelFormat.getBytesPerPixel(), m_payloadSize);
 
-    for (size_t i = 0; i < MAX_FRAMES; i++)
+    // Only reallocate if size increased or buffers not yet allocated
     {
-        delete[] m_buffer[i];
-        m_buffer[i] = new VmbUint8_t[m_bufferSize];
+        std::lock_guard<std::mutex> lock(m_bufferMutex);
+        if (newBufferSize <= m_bufferSize && m_buffer[0] != nullptr)
+        {
+            // nothing to do
+            return VmbErrorSuccess;
+        }
+
+        m_bufferSize = newBufferSize;
+
+        for (size_t i = 0; i < MAX_FRAMES; i++)
+        {
+            delete[] m_buffer[i];
+            m_buffer[i] = nullptr;
+            m_buffer[i] = new VmbUint8_t[m_bufferSize];
+        }
     }
 
     return VmbErrorSuccess;
@@ -358,6 +373,7 @@ VmbError_t AlliedVisionCamera::createPropertyFromFeature(const VmbFeatureInfo_t 
 
 const unsigned char *AlliedVisionCamera::GetImageBuffer()
 {
+    std::lock_guard<std::mutex> lock(m_bufferMutex);
     return reinterpret_cast<VmbUint8_t *>(m_buffer[0]);
 }
 
@@ -389,21 +405,26 @@ unsigned AlliedVisionCamera::GetImageHeight() const
 
 unsigned AlliedVisionCamera::GetImageBytesPerPixel() const
 {
+    // pixel format may be changed by callbacks, protect with mutex copy
+    std::lock_guard<std::mutex> lock(m_bufferMutex);
     return m_currentPixelFormat.getBytesPerPixel();
 }
 
 long AlliedVisionCamera::GetImageBufferSize() const
 {
+    std::lock_guard<std::mutex> lock(m_bufferMutex);
     return m_bufferSize;
 }
 
 unsigned AlliedVisionCamera::GetBitDepth() const
 {
+    std::lock_guard<std::mutex> lock(m_bufferMutex);
     return m_currentPixelFormat.getBitDepth();
 }
 
 unsigned AlliedVisionCamera::GetNumberOfComponents() const
 {
+    std::lock_guard<std::mutex> lock(m_bufferMutex);
     return m_currentPixelFormat.getNumberOfComponents();
 }
 
@@ -761,6 +782,8 @@ int AlliedVisionCamera::onProperty(MM::PropertyBase *pProp, MM::ActionType eAct)
 
 void AlliedVisionCamera::handlePixelFormatChange(const std::string &pixelType)
 {
+    // Protect pixel-format mutation with mutex to avoid races with capture/transform
+    std::lock_guard<std::mutex> lock(m_bufferMutex);
     m_currentPixelFormat.setPixelType(pixelType);
 }
 
@@ -1165,14 +1188,27 @@ int AlliedVisionCamera::SnapImage()
     {
         return DEVICE_CAMERA_BUSY_ACQUIRING;
     }
-    resizeImageBuffer();
 
-    VmbFrame_t frame;
-    frame.buffer = m_buffer[0];
-    frame.bufferSize = m_payloadSize;
+    // Ensure any previously announced frames are revoked before touching buffers.
+    // Ignore errors but attempt revoke to reduce risk of use-after-free.
+    (void)m_sdk->VmbFrameRevokeAll_t(m_handle);
 
-    VmbError_t err = VmbErrorSuccess;
-    err = m_sdk->VmbFrameAnnounce_t(m_handle, &frame, sizeof(VmbFrame_t));
+    // resize (will only reallocate if needed)
+    VmbError_t err = resizeImageBuffer();
+    if (err != VmbErrorSuccess)
+    {
+        LOG_ERROR(err, "Error while resizing image buffer for SnapImage!");
+        return err;
+    }
+
+    {
+        // Use class-owned frame to avoid stack lifetime issues.
+        std::lock_guard<std::mutex> lock(m_bufferMutex);
+        m_snapFrame.buffer = m_buffer[0];
+        m_snapFrame.bufferSize = m_payloadSize;
+    }
+
+    err = m_sdk->VmbFrameAnnounce_t(m_handle, &m_snapFrame, sizeof(VmbFrame_t));
     if (err != VmbErrorSuccess)
     {
         LOG_ERROR(err, "Error while snapping image!");
@@ -1186,7 +1222,7 @@ int AlliedVisionCamera::SnapImage()
         (void)StopSequenceAcquisition();
         return err;
     }
-    err = m_sdk->VmbCaptureFrameQueue_t(m_handle, &frame, nullptr);
+    err = m_sdk->VmbCaptureFrameQueue_t(m_handle, &m_snapFrame, nullptr);
     if (err != VmbErrorSuccess)
     {
         LOG_ERROR(err, "Error while snapping image!");
@@ -1201,7 +1237,7 @@ int AlliedVisionCamera::SnapImage()
         return err;
     }
     m_isAcquisitionRunning = true;
-    err = m_sdk->VmbCaptureFrameWait_t(m_handle, &frame, 3000);
+    err = m_sdk->VmbCaptureFrameWait_t(m_handle, &m_snapFrame, 3000);
     if (err != VmbErrorSuccess)
     {
         LOG_ERROR(err, "Error while snapping image!");
@@ -1209,7 +1245,7 @@ int AlliedVisionCamera::SnapImage()
         return err;
     }
 
-    err = transformImage(&frame);
+    err = transformImage(&m_snapFrame);
     if (err != VmbErrorSuccess)
     {
         LOG_ERROR(err, "Error while snapping image - cannot transform image!");
@@ -1248,10 +1284,14 @@ int AlliedVisionCamera::StartSequenceAcquisition(long numImages, double interval
 
     for (size_t i = 0; i < MAX_FRAMES; i++)
     {
-        m_frames[i].buffer = m_buffer[i];
-        m_frames[i].bufferSize = m_payloadSize;
-        m_frames[i].context[0] = this;                        //<! Pointer to camera
-        m_frames[i].context[1] = reinterpret_cast<void *>(i); //<! Pointer to frame index
+        // protect buffer read while assigning
+        {
+            std::lock_guard<std::mutex> lock(m_bufferMutex);
+            m_frames[i].buffer = m_buffer[i];
+            m_frames[i].bufferSize = m_payloadSize;
+            m_frames[i].context[0] = this;                        //<! Pointer to camera
+            m_frames[i].context[1] = reinterpret_cast<void *>(i); //<! Pointer to frame index
+        }
 
         auto frameCallback = [](const VmbHandle_t cameraHandle, const VmbHandle_t streamHandle, VmbFrame_t *frame)
         {
@@ -1346,7 +1386,17 @@ VmbError_t AlliedVisionCamera::transformImage(VmbFrame_t *frame)
     VmbError_t err = VmbErrorSuccess;
     VmbImage src{}, dest{};
     VmbTransformInfo info{};
-    std::shared_ptr<VmbUint8_t> tempBuff = std::shared_ptr<VmbUint8_t>(new VmbUint8_t[m_bufferSize]);
+
+    // copy needed state under mutex
+    VmbUint32_t localBufferSize = 0;
+    VmbPixelFormatType localDestFormat = VmbPixelFormatMono8;
+    {
+        std::lock_guard<std::mutex> lock(m_bufferMutex);
+        localBufferSize = m_bufferSize;
+        localDestFormat = m_currentPixelFormat.getVmbFormat();
+    }
+
+    std::shared_ptr<VmbUint8_t> tempBuff = std::shared_ptr<VmbUint8_t>(new VmbUint8_t[localBufferSize]);
     auto srcBuff = reinterpret_cast<VmbUint8_t *>(frame->buffer);
 
     src.Data = srcBuff;
@@ -1362,7 +1412,7 @@ VmbError_t AlliedVisionCamera::transformImage(VmbFrame_t *frame)
         return err;
     }
 
-    err = m_sdk->VmbSetImageInfoFromPixelFormat_t(m_currentPixelFormat.getVmbFormat(), frame->width, frame->height, &dest);
+    err = m_sdk->VmbSetImageInfoFromPixelFormat_t(localDestFormat, frame->width, frame->height, &dest);
     if (err != VmbErrorSuccess)
     {
         LOG_ERROR(err, "Cannot set image info from pixel format!");
@@ -1376,7 +1426,8 @@ VmbError_t AlliedVisionCamera::transformImage(VmbFrame_t *frame)
         return err;
     }
 
-    memcpy(srcBuff, tempBuff.get(), m_bufferSize);
+    // Use localBufferSize for copy
+    memcpy(srcBuff, tempBuff.get(), localBufferSize);
     return err;
 }
 
@@ -1398,8 +1449,18 @@ void AlliedVisionCamera::insertFrame(VmbFrame_t *frame)
         md.put(MM::g_Keyword_Metadata_CameraLabel, m_cameraName);
 
         VmbUint8_t *buffer = reinterpret_cast<VmbUint8_t *>(frame->buffer);
-        err = GetCoreCallback()->InsertImage(this, buffer, GetImageWidth(), GetImageHeight(), m_currentPixelFormat.getBytesPerPixel(),
-                                             m_currentPixelFormat.getNumberOfComponents(), md.Serialize().c_str());
+
+        // copy pixel format / bytes-per-pixel under lock to avoid race with property callbacks
+        unsigned bytesPerPixel = 0;
+        unsigned components = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_bufferMutex);
+            bytesPerPixel = m_currentPixelFormat.getBytesPerPixel();
+            components = m_currentPixelFormat.getNumberOfComponents();
+        }
+
+        err = GetCoreCallback()->InsertImage(this, buffer, GetImageWidth(), GetImageHeight(), bytesPerPixel,
+                                             components, md.Serialize().c_str());
 
         if (IsCapturing())
         {

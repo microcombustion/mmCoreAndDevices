@@ -24,6 +24,7 @@
 #include <regex>
 #include <unordered_map>
 #include <unordered_set>
+#include <mutex>
 
 #include "AlliedVisionDeviceBase.h"
 #include "DeviceBase.h"
@@ -456,6 +457,9 @@ private:
     std::array<VmbFrame_t, MAX_FRAMES> m_frames;   //<! Frames array for uManager
     std::array<VmbUint8_t *, MAX_FRAMES> m_buffer; //<! Images buffers for uManager
 
+    // single reusable frame for SnapImage (avoids stack lifetime issues)
+    VmbFrame_t m_snapFrame;
+
     VmbUint32_t m_bufferSize;    //<! Buffer size of image for uManager
     VmbUint32_t m_payloadSize;   //<! Payload size of image for Vimba
     bool m_isAcquisitionRunning; //<! Sequence acquisition status (true if running)
@@ -468,6 +472,9 @@ private:
     
     static const std::unordered_set<std::string> m_ipAddressFeatures;
     static const std::unordered_set<std::string> m_macAddressFeatures;
+
+    // mutex protecting buffer/pixel-format state
+    mutable std::mutex m_bufferMutex;
 };
 
 #endif
