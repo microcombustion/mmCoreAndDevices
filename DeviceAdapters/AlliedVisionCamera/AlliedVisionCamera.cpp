@@ -227,18 +227,29 @@ VmbError_t AlliedVisionCamera::setupProperties()
 
 VmbError_t AlliedVisionCamera::resizeImageBuffer()
 {
-    VmbError_t err = m_sdk->VmbPayloadSizeGet_t(m_handle, &m_payloadSize);
+    VmbUint32_t payloadSize = 0;
+    VmbError_t err = m_sdk->VmbPayloadSizeGet_t(m_handle, &payloadSize);
     if (err != VmbErrorSuccess)
     {
         LOG_ERROR(err, "Error while reading payload size");
         return err;
     }
 
-    VmbUint32_t newBufferSize = std::max(GetImageWidth() * GetImageHeight() * m_currentPixelFormat.getBytesPerPixel(), m_payloadSize);
+    const unsigned width = GetImageWidth();
+    const unsigned height = GetImageHeight();
+
+    unsigned bytesPerPixel = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_bufferMutex);
+        bytesPerPixel = m_currentPixelFormat.getBytesPerPixel();
+    }
+
+    VmbUint32_t newBufferSize = std::max(width * height * bytesPerPixel, payloadSize);
 
     // Only reallocate if size increased or buffers not yet allocated
     {
         std::lock_guard<std::mutex> lock(m_bufferMutex);
+        m_payloadSize = payloadSize;
         if (newBufferSize <= m_bufferSize && m_buffer[0] != nullptr)
         {
             // nothing to do
@@ -255,6 +266,7 @@ VmbError_t AlliedVisionCamera::resizeImageBuffer()
         }
     }
 
+    LogMessage("AlliedVisionCamera: resized buffers to " + std::to_string(m_bufferSize));
     return VmbErrorSuccess;
 }
 
@@ -1191,6 +1203,18 @@ int AlliedVisionCamera::SnapImage()
 
     // Ensure any previously announced frames are revoked before touching buffers.
     // Ignore errors but attempt revoke to reduce risk of use-after-free.
+    {
+        VmbError_t endErr = m_sdk->VmbCaptureEnd_t(m_handle);
+        if (endErr != VmbErrorSuccess)
+        {
+            LOG_ERROR(endErr, "Error while ending capture before flush");
+        }
+        VmbError_t flushErr = m_sdk->VmbCaptureQueueFlush_t(m_handle);
+        if (flushErr != VmbErrorSuccess)
+        {
+            LOG_ERROR(flushErr, "Error while flushing capture queue before revoke");
+        }
+    }
     (void)m_sdk->VmbFrameRevokeAll_t(m_handle);
 
     // resize (will only reallocate if needed)
