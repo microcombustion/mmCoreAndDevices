@@ -94,16 +94,15 @@ public:
     int ClearROI();
 
     // sequence-acquisition-related functions
-    int PrepareSequenceAcqusition() { return DEVICE_OK; }
-    //int StartSequenceAcquisition(double interval);
+    int StartSequenceAcquisition(double interval_ms);
     int StartSequenceAcquisition(long numImages, double interval_ms, bool stopOnOverflow);
     int StopSequenceAcquisition();
     bool IsCapturing();
+    bool Busy() { return false; }
 
     // pixel-size-related functions
     // the GenICam spec and the JAI sdk have no way to query sensor pixel size.
     double GetNominalPixelSizeUm() const { return 1.0; }
-    double GetPixelSizeUm() const { return 1.0 * GetBinning(); }
 
     int GetBinning() const;
     int SetBinning(int binSize);

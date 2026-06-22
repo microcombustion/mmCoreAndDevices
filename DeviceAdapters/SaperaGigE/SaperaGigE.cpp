@@ -652,6 +652,17 @@ int SaperaGigE::StopSequenceAcquisition()
 }
 
 /**
+* Required by the MM::Camera API.
+* Will forward to StartSequenceAcquisition(LONG_MAX, interval_ms, false) once Checkpoint 2
+* (native-callback streaming acquisition) lands.
+*/
+int SaperaGigE::StartSequenceAcquisition(double interval_ms)
+{
+    //@TODO: Implement Sequence Acquisition
+    return DEVICE_NOT_YET_IMPLEMENTED;
+}
+
+/**
 * Simple implementation of Sequence Acquisition
 * A sequence acquisition should run on its own thread and transport new images
 * coming of the camera into the MMCore circular buffer.
