@@ -38,8 +38,43 @@ SDK-specific questions are resolved); cleanup is **Checkpoint 3**.
 - End state = full streaming acquisition; Checkpoint 1 (compile-only) is a stepping stone.
 - Acquisition model = **native Sapera transfer callback** (`Xfer_->Grab()` + `XferCallback`),
   no snap-loop thread (the dormant `SequenceThread` is unused in Ck2, deleted in Ck3).
-- No Windows+Sapera SDK dev box yet: **Checkpoint 1 is specified for execution now**;
-  **Checkpoint 2 is preliminary**, to be refined/validated once the SDK box exists.
+- A Windows box with the Sapera LT SDK installed (`C:\Program Files\Teledyne DALSA\Sapera`)
+  is now available. Cross-checking Checkpoint 2 design questions B1/B2 against the actual
+  `Classes/Basic/*.h` headers and the SDK's own example/demo sources (see "SDK verification"
+  below) resolved both **without needing a build**: **Checkpoint 1 is specified for execution
+  now**; **Checkpoint 2's (A) steps are now fully specified** (B1/B2 confirmed by inspection of
+  installed headers + demos); only B3 remains as an adapter-side audit item, not an SDK
+  unknown. Compiling/running Checkpoint 2 on this box (no Sapera hardware required for a
+  build-only check) is still the way to catch syntax/API-signature mistakes before hardware
+  testing.
+
+### SDK verification (done against the installed Sapera LT SDK, no build yet)
+
+Checked `Classes/Basic/SapTransfer.h`, `SapBuffer.h`, `SapBufferWithTrash.h`, `SapTransferEx.h`,
+and example/demo sources under the SDK install (`Examples/Classes/GrabConsole/GrabCPP.cpp`,
+`Demos/Classes/Vc/SeqGrabDemo/SeqGrabDemoDlg.cpp`, `Demos/Classes/Vc/GigeCameraDemo/`):
+
+- **B1 confirmed exactly as assumed.** `SapTransfer` (base of `SapAcqDeviceToBuf`, which the
+  adapter already uses) declares `Grab()`, `Freeze()`, `Wait(int timeout)`, `Snap(int count)`.
+  `GrabCPP.cpp` free-running start/stop is literally `Xfer->Grab()` ... `Xfer->Freeze()`;
+  `Xfer->Wait(5000)`, all from the calling thread — matching the baseline's "all three run only
+  on the MMCore thread" design.
+- **B2 turns out to already be resolved — not a real unknown.** `SapBuffer::GetIndex()` is
+  documented in the header as `"Index of last grabbed buffer"`, and the no-index
+  `SapBuffer::ReadRect(x,y,w,h,data)` overload reads at that index implicitly. The adapter's
+  *existing* `GetImageBuffer()` (`SaperaGigE.cpp:477`, `Buffers_.ReadRect(...)` with no index
+  arg) already uses this. `SeqGrabDemoDlg.cpp` confirms the pattern is correct *from inside the
+  callback*: it reads `m_Buffers->GetIndex()` synchronously during/around the xfer-callback
+  invocation, with no separate "which buffer just completed" lookup via `pInfo`. So
+  Checkpoint 2's `XferCallback` can call the same no-index `Buffers_.ReadRect(...)` already used
+  by `GetImageBuffer()`, synchronously inside the callback, and get the correct just-completed
+  buffer. The original wording below ("highest-risk unknown") overstated the risk — it is
+  superseded by this finding.
+- **B3 is unaffected** — it was already correctly scoped as an adapter-side property-handler
+  audit, not an SDK question.
+- Also confirmed: the adapter's `ErrorBox()` (`SaperaGigE.cpp:74-77`) is a real blocking
+  `MessageBox` call, and the `SapAcqDeviceToBuf`/`SapBufferWithTrash`/`Xfer_` wiring described
+  below matches the current `.cpp` line-for-line.
 
 ---
 
@@ -71,7 +106,7 @@ behavior). Verify by inspection (see Verification).
 
 ---
 
-## Checkpoint 2 — Native-callback streaming acquisition (PRELIMINARY; refine on SDK box).
+## Checkpoint 2 — Native-callback streaming acquisition (fully specified; build-verify on SDK box).
 
 The transfer callback is already wired: `SynchronizeBuffers()` calls
 `SapAcqDeviceToBuf(&AcqDevice_, &Buffers_, XferCallback, this)` (`SaperaGigE.cpp:1029`),
@@ -80,9 +115,11 @@ buffers are `SapBufferWithTrash(3, &AcqDevice_)` (cpp:1027), and a **static**
 dead `PrepareForAcq` reference (667) already exist. Reference design: the Aravis adapter
 (`DeviceAdapters/Aravis/AravisCamera.cpp`), which streams purely from the SDK callback.
 
-This checkpoint is split into **(A) known steps** and **(B) design questions to confirm on
-the SDK box**, because the exact Sapera calls for "which buffer just completed" and
-continuous grab/stop cannot be verified without the (Windows-only) SDK headers.
+This checkpoint is split into **(A) known steps** and **(B) design questions**. B1 and B2 below
+are now confirmed by inspection of the installed SDK headers and example sources (see
+"SDK verification" above); only B3 remains as an adapter-side audit item. Build-only
+compilation on the SDK box (no camera hardware needed) is still worthwhile to catch
+signature/typo mistakes before hardware testing.
 
 ### Lifecycle contract (resolves who does what, once)
 
@@ -221,35 +258,44 @@ counter), release it, then make the SDK/Core call.
   not use the snap-loop `SequenceThread`** — the native callback replaces it; its deletion
   is Checkpoint 3.
 
-### (B) Design questions to confirm on the SDK box (do not guess in code)
+### (B) Design questions — B1/B2 resolved by SDK inspection, B3 is an adapter-side audit
 
-1. **Continuous grab vs stop:** confirm the API for free-running capture — likely
-   `Xfer_->Grab()` to start, `Xfer_->Freeze()` to request stop, and `Xfer_->Wait(timeout)`
-   to join. In the baseline design all three run **only on the MMCore thread**
-   (`Start`/`StopSequenceAcquisition`); the callback never stops, so callback-thread safety of
-   `Freeze()` is **not** required (matching how Aravis stops only from
-   `StopSequenceAcquisition`). What must be confirmed: that `Grab()`/`Freeze()`/`Wait()` are
-   the right continuous-mode calls and a sensible `Wait` timeout. Callback-safe `Freeze()`
-   only becomes necessary if the optional camera-side self-limiting refinement is later
-   adopted.
-2. **Completed-buffer identity:** the current `GetImageBuffer()` (cpp:474) reads
-   `Buffers_.ReadRect(...)` on the buffer's *current* index, which races a free-running
-   transfer across the 3 + trash buffers. Determine how to read the **exact** frame that
-   just completed — e.g. the index from `pInfo` / `pInfo->GetTransfer()` / the transfer's
-   current `SapBuffer::GetIndex()` — and read that specific buffer so frames are neither
-   duplicated, skipped, nor torn. This is the highest-risk unknown.
-3. **`InsertImage` width/height/bytes during streaming:** confirm `img_`
-   width/height/`bytesPerPixel_` are stable while grabbing (they are set in
+1. **Continuous grab vs stop — RESOLVED.** `Xfer_->Grab()` to start, `Xfer_->Freeze()` to
+   request stop, `Xfer_->Wait(timeout)` to join — confirmed against `SapTransfer.h` and
+   `Examples/Classes/GrabConsole/GrabCPP.cpp` (see "SDK verification" above). In the baseline
+   design all three run **only on the MMCore thread** (`Start`/`StopSequenceAcquisition`); the
+   callback never stops, so callback-thread safety of `Freeze()` is **not** required (matching
+   how Aravis stops only from `StopSequenceAcquisition`, and how `GrabCPP.cpp` calls
+   `Grab`/`Freeze`/`Wait` from the same thread). A `Wait` timeout of a few seconds (matching the
+   existing `SnapImage()`'s 16000 ms pattern, cpp:455) is reasonable; exact value is a tuning
+   choice, not a blocking unknown. Callback-safe `Freeze()` only becomes necessary if the
+   optional camera-side self-limiting refinement is later adopted.
+2. **Completed-buffer identity — RESOLVED, not actually racy.** The current `GetImageBuffer()`
+   (cpp:474) reads `Buffers_.ReadRect(...)` with no index argument, which reads at
+   `SapBuffer::GetIndex()` — documented in `SapBuffer.h` as "Index of last grabbed buffer".
+   `Demos/Classes/Vc/SeqGrabDemo/SeqGrabDemoDlg.cpp` confirms this is the intended pattern:
+   it reads `m_Buffers->GetIndex()` synchronously from inside/around the xfer-callback
+   invocation, with no separate per-event buffer-index lookup via `pInfo`. So Checkpoint 2's
+   `XferCallback` reads the just-completed frame with the **same no-index
+   `Buffers_.ReadRect(...)` call already used by `GetImageBuffer()`**, called synchronously
+   inside the callback (which by the demos' pattern is invoked serially, one completed buffer
+   at a time) — no `pInfo`/`GetTransfer()`-based index lookup is needed. The original framing
+   of this as "the highest-risk unknown" is superseded.
+3. **`InsertImage` width/height/bytes during streaming — adapter-side, not an SDK question.**
+   Confirm `img_` width/height/`bytesPerPixel_` are stable while grabbing (they are set in
    `SynchronizeBuffers`/`ResizeImageBuffer`). Stability is *enforced* by the property-handler
-   guards added in (A) — this question is only to confirm the Sapera side does not itself
-   resize buffers mid-grab.
+   guards added in (A); the Sapera side does not itself resize buffers mid-grab (buffer
+   geometry is fixed at `Buffers_.Create()` time, cpp:1027-1031, and is not touched again until
+   `SynchronizeBuffers()` is called), so this is a closed question once the (A) guards are in
+   place.
 
 **Checkpoint 2 result (target):** working live/MDA acquisition on the modern base → the
-adapter is truly non-legacy. This is an **implementation target, not a compile-green
-checkpoint**: the (A) steps cannot be claimed to compile until the Sapera callback/buffer
-APIs in (B) are known, and behavioral correctness is validated only on the Windows + Sapera
-SDK build. Treat "Checkpoint 2 compiles" as something to verify on the SDK box, not assert
-here.
+adapter is truly non-legacy. The (A) steps are now fully specified (B1/B2 confirmed against
+the installed SDK headers/demos; B3 is a closed adapter-side audit). This is still an
+**implementation target, not a claimed-compiling checkpoint here**: actual compilation should
+be verified on the SDK box (a build-only check, no camera hardware required, would catch
+signature/typo mistakes), and behavioral correctness (frame integrity, clean stop, no
+mid-sequence reconfiguration) can only be validated against real camera hardware.
 
 ---
 
@@ -267,7 +313,10 @@ Each bullet is independent and keeps the build green.
 
 ## Verification
 
-No local Sapera build (Windows-only SDK); until the SDK box exists, verify by inspection:
+A Windows box with the Sapera LT SDK is now available (headers/libs under
+`C:\Program Files\Teledyne DALSA\Sapera`), so a real build-only compile check (no camera
+hardware needed) is possible and should be done once Checkpoint 1/2 edits land. Until that
+build is run, verify by inspection:
 
 1. **Pure-virtual coverage:** every `= 0;` in `CCameraBase` (DeviceBase.h:1377-1583) has a
    matching override in `SaperaGigE.h` — confirmed set: `GetImageBuffer`, `GetImageWidth`,
@@ -277,8 +326,8 @@ No local Sapera build (Windows-only SDK); until the SDK box exists, verify by in
 2. **No stale overrides:** `PrepareSequenceAcqusition`, `GetPixelSizeUm`, `GetComponentName`
    absent from the adapter.
 3. **Signatures bind:** `InsertImage` 5-arg call matches `CoreCallback`.
-4. **Later (SDK box), streaming correctness:** build on Windows with Sapera LT; run snap,
-   then live mode and a finite MDA. Confirm:
+4. **Later (needs camera hardware), streaming correctness:** build on Windows with Sapera LT
+   (SDK box now available); run snap, then live mode and a finite MDA. Confirm:
    - frame content correct, with **no duplicated/skipped/torn frames** (validates design
      question B2 — completed-buffer identity);
    - **finite MDA delivers exactly the requested number of frames to the application**, with
@@ -299,9 +348,11 @@ No local Sapera build (Windows-only SDK); until the SDK box exists, verify by in
 
 ## Scope notes
 
-- Checkpoint 1 is compile-green and fully specified for execution now. Checkpoint 2 is an
-  *implementation target* whose compile and behavior can only be validated on a Windows +
-  Sapera SDK box (after the (B) questions are resolved); Checkpoint 3 is cleanup.
+- Checkpoint 1 is compile-green and fully specified for execution now. Checkpoint 2's design
+  is now fully specified (B1/B2 resolved by inspection of the installed Sapera LT SDK; B3 is a
+  closed adapter-side audit) — it remains an *implementation target* whose actual compile and
+  runtime behavior should still be verified on the Windows + Sapera SDK box (build-only check
+  needs no hardware; behavioral correctness needs camera hardware). Checkpoint 3 is cleanup.
 - All edits confined to `DeviceAdapters/SaperaGigE/{SaperaGigE.h,SaperaGigE.cpp}`.
   No DIV bump (adapter-only change).
 - The scratch drafts in the repo root (the two prior PLAN_*.md files) are temporary and
