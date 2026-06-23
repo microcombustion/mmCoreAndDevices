@@ -32,7 +32,8 @@
 #include "math.h"
 #include "SapClassBasic.h"
 #include "../MMDevice/ModuleInterface.h"
-#include <climits>
+#include <algorithm>
+#include <limits>
 #include <string>
 #include <iterator>
 #include <map>

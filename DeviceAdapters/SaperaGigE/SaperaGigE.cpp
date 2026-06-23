@@ -671,7 +671,7 @@ int SaperaGigE::StartSequenceAcquisition(double interval_ms)
     // The camera does not self-limit; the acquisition engine stops it once it has pulled
     // the frames it wants. Forward to the counted overload with an effectively unbounded
     // count and no overflow stop.
-    return StartSequenceAcquisition(LONG_MAX, interval_ms, false);
+    return StartSequenceAcquisition((std::numeric_limits<long>::max)(), interval_ms, false);
 }
 
 /**
@@ -777,14 +777,14 @@ int SaperaGigE::OnPixelSize(MM::PropertyBase* pProp, MM::ActionType eAct)
 
 long SaperaGigE::CheckValue(const char* key, long value)
 {
-    INT64 min, max, inc;
+    INT64 minVal, maxVal, inc;
     AcqDevice_.GetFeatureInfo(key, &AcqFeature_);
     AcqFeature_.GetInc(&inc);
-    AcqFeature_.GetMin(&min);
-    AcqFeature_.GetMax(&max);
+    AcqFeature_.GetMin(&minVal);
+    AcqFeature_.GetMax(&maxVal);
 
     long out = (value / (long)inc) * (long)inc;
-    out = max((long)min, min((long)max, out));
+    out = std::clamp(out, (long)minVal, (long)maxVal);
 
     if (value != out)
         LogMessage((std::string)"Encountered invalid value for '" + key
@@ -1040,7 +1040,7 @@ void SaperaGigE::GenerateImage()
     double step = maxValue / maxExp;
     unsigned char* pBuf = const_cast<unsigned char*>(img_.GetPixels());
     double exposureMs = GetExposure();
-    memset(pBuf, (int)(step * max(exposureMs, maxExp)), GetImageBufferSize());
+    memset(pBuf, (int)(step * (std::max)(exposureMs, maxExp)), GetImageBufferSize());
 }
 
 /*
