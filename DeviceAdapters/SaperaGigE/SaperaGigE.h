@@ -32,6 +32,7 @@
 #include "math.h"
 #include "SapClassBasic.h"
 #include "../MMDevice/ModuleInterface.h"
+#include <climits>
 #include <string>
 #include <iterator>
 #include <map>
@@ -98,6 +99,9 @@ public:
     int StartSequenceAcquisition(long numImages, double interval_ms, bool stopOnOverflow);
     int StopSequenceAcquisition();
     bool IsCapturing();
+    // Busy() reflects blocking synchronous device operations, of which this
+    // callback-driven adapter has none during a sequence. Sequence/streaming state is
+    // reported solely through IsCapturing() -- do NOT "fix" Busy() to track the sequence.
     bool Busy() { return false; }
 
     // pixel-size-related functions
@@ -130,12 +134,24 @@ private:
     friend class SequenceThread;
     static const int MAX_BIT_DEPTH = 12;
 
+    // img_ is the single staging buffer shared by snap (GetImageBuffer) and the
+    // streaming XferCallback. During a sequence, ONLY the callback writes img_: snap is
+    // rejected (sequenceStarted_), buffer-resizing property changes are rejected (the
+    // OnXxx guards), and GetImageBuffer() is not on the streaming path (frames go
+    // straight to InsertImage). A maintainer must not read img_ from the MMCore thread
+    // while a sequence is running.
     ImgBuffer img_;
     SequenceThread* thd_;
     int bytesPerPixel_;
     int bitsPerPixel_;
     bool initialized_;
-    bool sequenceRunning_;
+    // Single load-bearing lifecycle flag: a transfer is live and not yet torn down. Its
+    // flip to false inside StopSequenceAcquisition() is the once-only guard for both the
+    // hardware stop and AcqFinished. Also what SnapImage() checks to reject snap during a
+    // sequence. Read/written only under seqLock_.
+    bool sequenceStarted_;
+    long imageCounter_;       // image-number metadata/diagnostics only; does not drive stopping
+    MMThreadLock seqLock_;    // guards sequenceStarted_ and imageCounter_ together
 
     int ResizeImageBuffer();
     void GenerateImage();

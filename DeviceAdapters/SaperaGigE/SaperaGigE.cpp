@@ -95,7 +95,8 @@ SaperaGigE::SaperaGigE() :
     bitsPerPixel_(8),
     initialized_(false),
     thd_(0),
-    sequenceRunning_(false),
+    sequenceStarted_(false),
+    imageCounter_(0),
     Roi_(NULL)
 {
 
@@ -441,9 +442,12 @@ int SaperaGigE::FreeHandles()
 */
 int SaperaGigE::SnapImage()
 {
-    // This will always be false, as no sequences will ever run
-    if (sequenceRunning_)
-        return DEVICE_CAMERA_BUSY_ACQUIRING;
+    // Reject snap while a callback-driven sequence is live; snap and grab share img_.
+    {
+        MMThreadGuard g(seqLock_);
+        if (sequenceStarted_)
+            return DEVICE_CAMERA_BUSY_ACQUIRING;
+    }
     // Start image capture
     Xfer_->SetCommandTimeout(1000);
     if (!Xfer_->Snap(1))
@@ -543,6 +547,9 @@ long SaperaGigE::GetImageBufferSize() const
 */
 int SaperaGigE::SetROI(unsigned x, unsigned y, unsigned xSize, unsigned ySize)
 {
+    // img_ geometry must stay stable while the callback is streaming into it.
+    if (IsCapturing())
+        return DEVICE_CAMERA_BUSY_ACQUIRING;
     LogMessage((std::string)"Setting Region of Interest");
     if (xSize == 0 && ySize == 0)
         return ClearROI();
@@ -575,6 +582,9 @@ int SaperaGigE::GetROI(unsigned& x, unsigned& y, unsigned& xSize, unsigned& ySiz
 */
 int SaperaGigE::ClearROI()
 {
+    // img_ geometry must stay stable while the callback is streaming into it.
+    if (IsCapturing())
+        return DEVICE_CAMERA_BUSY_ACQUIRING;
     Roi_->ResetRoi();
     ResizeImageBuffer();
     return DEVICE_OK;
@@ -639,65 +649,103 @@ int SaperaGigE::SetBinning(int binF)
 //}
 
 /**
-* Stop and wait for the Sequence thread finished
+* Stop a running sequence acquisition.
+* This is the single teardown path for streaming: it is the only place that flips
+* sequenceStarted_ to false, stops the hardware, and fires AcqFinished. It is called by
+* the client / acquisition engine (an early user stop, or after a finite acquisition has
+* drained its frames) -- MMCore has no internal thread that auto-stops the sequence.
+* Idempotent: a redundant second call (e.g. engine cleanup after the user already
+* stopped) is a no-op.
+* Required by the MM::Camera API.
 */
 int SaperaGigE::StopSequenceAcquisition()
 {
-    //@TODO: Implement Sequence Acquisition
-    return DEVICE_NOT_YET_IMPLEMENTED;
-    /*thd_->Stop();
-    thd_->wait();
-    sequenceRunning_ = false;
-    return DEVICE_OK;*/
+    // Flip the flag under the lock so exactly one caller runs the teardown below.
+    seqLock_.Lock();
+    if (!sequenceStarted_)
+    {
+        seqLock_.Unlock();
+        return DEVICE_OK;
+    }
+    sequenceStarted_ = false;
+    seqLock_.Unlock();
+
+    // Never hold seqLock_ while calling into the Sapera SDK or MMCore (they can block or
+    // re-enter). Request the stop, join the transfer, then signal acquisition finished.
+    Xfer_->Freeze();
+    if (!Xfer_->Wait(5000))
+        LogMessage("Timed out waiting for transfer to stop");
+    GetCoreCallback()->AcqFinished(this, 0);
+    return DEVICE_OK;
 }
 
 /**
+* Start a free-running (live) sequence acquisition.
 * Required by the MM::Camera API.
-* Will forward to StartSequenceAcquisition(LONG_MAX, interval_ms, false) once Checkpoint 2
-* (native-callback streaming acquisition) lands.
 */
 int SaperaGigE::StartSequenceAcquisition(double interval_ms)
 {
-    //@TODO: Implement Sequence Acquisition
-    return DEVICE_NOT_YET_IMPLEMENTED;
+    // The camera does not self-limit; the acquisition engine stops it once it has pulled
+    // the frames it wants. Forward to the counted overload with an effectively unbounded
+    // count and no overflow stop.
+    return StartSequenceAcquisition(LONG_MAX, interval_ms, false);
 }
 
 /**
-* Simple implementation of Sequence Acquisition
-* A sequence acquisition should run on its own thread and transport new images
-* coming of the camera into the MMCore circular buffer.
+* Start a sequence acquisition driven by the native Sapera transfer callback.
+* The camera free-runs; numImages/stopOnOverflow are accepted but not enforced
+* device-side -- a finite acquisition is stopped by the acquisition engine calling
+* StopSequenceAcquisition() after it has drained numImages frames from the circular
+* buffer (the proven Aravis client-stop pattern).
+* Required by the MM::Camera API.
 */
 int SaperaGigE::StartSequenceAcquisition(long numImages, double interval_ms, bool stopOnOverflow)
 {
-    //@TODO: Implement Sequence Acquisition
-    return DEVICE_NOT_YET_IMPLEMENTED;
-    /*if (sequenceRunning_)
     {
-        return DEVICE_CAMERA_BUSY_ACQUIRING;
+        MMThreadGuard g(seqLock_);
+        if (sequenceStarted_)
+            return DEVICE_CAMERA_BUSY_ACQUIRING;
     }
+
+    // Start the transfer first (Aravis order); only arm the sequence on success.
+    if (!Xfer_->Grab())
+    {
+        LogMessage("Failed to start continuous acquisition");
+        return DEVICE_ERR;
+    }
+
     int ret = GetCoreCallback()->PrepareForAcq(this);
     if (ret != DEVICE_OK)
     {
+        // PrepareForAcq failed after the transfer started: undo the start. The sequence
+        // never armed, so there is nothing to AcqFinish (AcqFinished pairs only with a
+        // successful PrepareForAcq).
+        Xfer_->Freeze();
+        Xfer_->Wait(5000);
         return ret;
     }
-    sequenceRunning_ = true;
-    thd_->SetLength(10);
-    thd_->Start();
-   return DEVICE_OK; */
+
+    MMThreadGuard g(seqLock_);
+    imageCounter_ = 0;
+    sequenceStarted_ = true;
+    return DEVICE_OK;
 }
 
 /*
- * Inserts Image and MetaData into MMCore circular Buffer
+ * Inserts the current staging buffer into the MMCore circular buffer.
+ * Retained only for the (now-dead) SequenceThread, which is deleted in Checkpoint 3;
+ * the streaming path inlines this logic in XferCallback.
  */
 int SaperaGigE::InsertImage()
 {
-    //@TODO: Implement Sequence Acquisition
-    return GetCoreCallback()->InsertImage(this, const_cast<unsigned char*>(img_.GetPixels()), GetImageWidth(), GetImageHeight(), GetImageBytesPerPixel());
+    return GetCoreCallback()->InsertImage(this, img_.GetPixels(), GetImageWidth(), GetImageHeight(), GetImageBytesPerPixel());
 }
 
 bool SaperaGigE::IsCapturing() {
-    //@TODO: Implement Sequence Acquisition
-    return sequenceRunning_;
+    // Reflects sequenceStarted_, which only goes false in StopSequenceAcquisition(), so
+    // this never reports "done" while the hardware is still transferring.
+    MMThreadGuard g(seqLock_);
+    return sequenceStarted_;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -711,6 +759,9 @@ int SaperaGigE::OnBinning(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
     if (eAct == MM::AfterSet)
     {
+        // Reconfiguration reallocates buffers; reject while streaming (see img_ invariant).
+        if (IsCapturing())
+            return DEVICE_CAMERA_BUSY_ACQUIRING;
         long binSize;
         pProp->Get(binSize);
         if (!AcqDevice_.SetFeatureValue("BinningVertical", int(binSize)))
@@ -814,6 +865,9 @@ int SaperaGigE::OnWidth(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
     if (eAct == MM::AfterSet)
     {
+        // Reconfiguration reallocates buffers; reject while streaming (see img_ invariant).
+        if (IsCapturing())
+            return DEVICE_CAMERA_BUSY_ACQUIRING;
         long value;
         pProp->Get(value);
 
@@ -836,6 +890,9 @@ int SaperaGigE::OnHeight(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
     if (eAct == MM::AfterSet)
     {
+        // Reconfiguration reallocates buffers; reject while streaming (see img_ invariant).
+        if (IsCapturing())
+            return DEVICE_CAMERA_BUSY_ACQUIRING;
         long value;
         pProp->Get(value);
 
@@ -858,6 +915,9 @@ int SaperaGigE::OnImageTimeout(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
     if (eAct == MM::AfterSet)
     {
+        // Reconfiguration reallocates buffers; reject while streaming (see img_ invariant).
+        if (IsCapturing())
+            return DEVICE_CAMERA_BUSY_ACQUIRING;
         double value;
         pProp->Get(value);
         int ret = SynchronizeBuffers("", -1, -1, value);
@@ -902,6 +962,9 @@ int SaperaGigE::OnPixelType(MM::PropertyBase* pProp, MM::ActionType eAct)
     AcqDevice_.GetFeatureValue("PixelFormat", pixelFormat, sizeof(pixelFormat));
     if (eAct == MM::AfterSet)
     {
+        // Reconfiguration reallocates buffers; reject while streaming (see img_ invariant).
+        if (IsCapturing())
+            return DEVICE_CAMERA_BUSY_ACQUIRING;
         std::string value;
         pProp->Get(value);
 
@@ -1058,14 +1121,50 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
     return DEVICE_OK;
 }
 
+/*
+ * Native Sapera transfer callback: invoked (serially, one completed buffer at a time)
+ * when the transfer finishes a frame. This is the streaming path -- it reads the
+ * just-completed buffer and pushes it into the MMCore circular buffer. It NEVER stops the
+ * hardware, calls Wait(), or calls AcqFinished(); teardown is StopSequenceAcquisition()'s
+ * sole responsibility.
+ *
+ * Locking rule: seqLock_ protects state only. We read the flag under the lock, release
+ * it, then make the SDK buffer read and the InsertImage call outside the lock, and
+ * finally re-take the lock to bump imageCounter_.
+ */
 void SaperaGigE::XferCallback(SapXferCallbackInfo* pInfo)
 {
-    // If grabbing in trash buffer, log a message
+    // The static callback has no instance; recover it from the context passed at
+    // SapAcqDeviceToBuf(..., this) construction. The instance is needed for LogMessage.
+    SaperaGigE* self = static_cast<SaperaGigE*>(pInfo->GetContext());
+
+    self->seqLock_.Lock();
+    bool started = self->sequenceStarted_;
+    self->seqLock_.Unlock();
+    if (!started)
+        return; // StopSequenceAcquisition() already flipped the flag: drop in-flight frames
+
+    // Buffer overflow: drop the frame and log it (no blocking MessageBox dialog).
     if (pInfo->IsTrash())
     {
-        ErrorBox((std::string)"Frames acquired in trash buffer: "
-            + std::to_string((INT64)pInfo->GetEventCount()), "Xfer");
+        self->LogMessage((std::string)"Frame(s) acquired in trash buffer: "
+            + std::to_string((INT64)pInfo->GetEventCount()));
+        return;
     }
+
+    // Read the just-completed buffer (the no-index ReadRect reads at GetIndex(), the last
+    // grabbed buffer) into the single staging buffer img_, then push to the core.
+    self->Buffers_.ReadRect(self->Roi_->GetXMin(), self->Roi_->GetYMin(),
+        self->img_.Width(), self->img_.Height(),
+        const_cast<unsigned char*>(self->img_.GetPixels()));
+    int ret = self->GetCoreCallback()->InsertImage(self, self->img_.GetPixels(),
+        self->GetImageWidth(), self->GetImageHeight(), self->GetImageBytesPerPixel());
+    if (ret != DEVICE_OK)
+        self->LogMessage("InsertImage failed in transfer callback");
+
+    self->seqLock_.Lock();
+    ++self->imageCounter_;
+    self->seqLock_.Unlock();
 }
 
 

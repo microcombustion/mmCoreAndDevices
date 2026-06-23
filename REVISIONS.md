@@ -272,15 +272,22 @@ counter), release it, then make the SDK/Core call.
    optional camera-side self-limiting refinement is later adopted.
 2. **Completed-buffer identity — RESOLVED, not actually racy.** The current `GetImageBuffer()`
    (cpp:474) reads `Buffers_.ReadRect(...)` with no index argument, which reads at
-   `SapBuffer::GetIndex()` — documented in `SapBuffer.h` as "Index of last grabbed buffer".
-   `Demos/Classes/Vc/SeqGrabDemo/SeqGrabDemoDlg.cpp` confirms this is the intended pattern:
-   it reads `m_Buffers->GetIndex()` synchronously from inside/around the xfer-callback
-   invocation, with no separate per-event buffer-index lookup via `pInfo`. So Checkpoint 2's
-   `XferCallback` reads the just-completed frame with the **same no-index
-   `Buffers_.ReadRect(...)` call already used by `GetImageBuffer()`**, called synchronously
-   inside the callback (which by the demos' pattern is invoked serially, one completed buffer
-   at a time) — no `pInfo`/`GetTransfer()`-based index lookup is needed. The original framing
-   of this as "the highest-risk unknown" is superseded.
+   `SapBuffer::GetIndex()` — documented in `SapBuffer.h:368` on the backing member
+   (`int m_Index; // Index of last grabbed buffer`; `GetIndex()` just returns it).
+   `Demos/Classes/Vc/SeqGrabDemo/SeqGrabDemoDlg.cpp:138/606` confirms `GetIndex()` itself is read
+   synchronously from inside the xfer-callback (via `CheckForLastFrame()`, called directly from
+   `XferCallback`, not via the dialog's `PostMessage`-deferred `OnUpdateControls`). **Correction
+   on re-verification (Windows + SDK box):** no demo or example source under
+   `Demos/Classes/Vc/*` or `Examples/Classes/*` actually calls `ReadRect` anywhere (confirmed by
+   grepping all `.cpp` sources) — they hand the buffer to `SapView::Show()` instead, which reads
+   the buffer internally (implementation not visible outside the compiled `SapClassBasic` lib).
+   So the demos directly confirm only the "read `GetIndex()` synchronously inside the callback"
+   half of the pattern; pairing that index with `ReadRect` inside the callback is the adapter's
+   own (pre-existing, in `GetImageBuffer()`) extension of it, not something an example
+   independently demonstrates. This is still reasonable — `ReadRect`'s no-index overload is
+   documented to read at `GetIndex()`, and the build verification below exercises the exact call
+   — but the original wording overstated demo coverage of `ReadRect` specifically; corrected here
+   rather than treated as a new open question.
 3. **`InsertImage` width/height/bytes during streaming — adapter-side, not an SDK question.**
    Confirm `img_` width/height/`bytesPerPixel_` are stable while grabbing (they are set in
    `SynchronizeBuffers`/`ResizeImageBuffer`). Stability is *enforced* by the property-handler
@@ -313,10 +320,18 @@ Each bullet is independent and keeps the build green.
 
 ## Verification
 
-A Windows box with the Sapera LT SDK is now available (headers/libs under
-`C:\Program Files\Teledyne DALSA\Sapera`), so a real build-only compile check (no camera
-hardware needed) is possible and should be done once Checkpoint 1/2 edits land. Until that
-build is run, verify by inspection:
+**Build-only compile check — DONE (back on the Windows + Sapera LT SDK box).**
+`msbuild DeviceAdapters/SaperaGigE/SaperaGigE.sln /t:Rebuild /p:Configuration=Debug
+/p:Platform=x64` against the installed SDK (`C:\Program Files\Teledyne DALSA\Sapera`,
+confirmed present) succeeds with **0 warnings, 0 errors**, producing
+`mmgr_dal_SaperaGigE.dll` and linking against the real `SapClassBasic.lib`. This exercises
+the checkpoint 1+2 code (current `HEAD`, commit `0ae66f729`) against the actual SDK headers
+(`Classes/Basic/*.h`), not just inspection — confirms the `SapAcqDeviceToBuf`/`SapTransfer`/
+`SapXferCallbackInfo`/`SapBuffer`/`SapBufferRoi` signatures used (`Grab`/`Freeze`/`Wait(int)`,
+`GetContext`/`IsTrash`/`GetEventCount`, `ReadRect(x,y,w,h,data)`, `GetXMin`/`GetYMin`) all bind
+exactly as assumed. No camera hardware is required for this check and none was used; behavioral
+correctness (frame integrity, clean stop, no mid-sequence reconfiguration) still needs real
+hardware. Below is the by-inspection verification this build confirms:
 
 1. **Pure-virtual coverage:** every `= 0;` in `CCameraBase` (DeviceBase.h:1377-1583) has a
    matching override in `SaperaGigE.h` — confirmed set: `GetImageBuffer`, `GetImageWidth`,
@@ -348,11 +363,13 @@ build is run, verify by inspection:
 
 ## Scope notes
 
-- Checkpoint 1 is compile-green and fully specified for execution now. Checkpoint 2's design
-  is now fully specified (B1/B2 resolved by inspection of the installed Sapera LT SDK; B3 is a
-  closed adapter-side audit) — it remains an *implementation target* whose actual compile and
-  runtime behavior should still be verified on the Windows + Sapera SDK box (build-only check
-  needs no hardware; behavioral correctness needs camera hardware). Checkpoint 3 is cleanup.
+- Checkpoint 1 is compile-green; Checkpoint 2 is implemented and now **build-verified** on the
+  Windows + Sapera LT SDK box (`msbuild .../SaperaGigE.sln /t:Rebuild`, 0 warnings/errors,
+  real SDK headers/libs — see Verification). B1/B2 were resolved by SDK inspection and the
+  build confirms the signatures bind; B3 remains a closed adapter-side audit (guards are in
+  place in the current code). Remaining gap is **behavioral** correctness on real camera
+  hardware (frame integrity, clean stop, no mid-sequence reconfiguration) — not yet done.
+  Checkpoint 3 (cleanup: dead `SequenceThread`, etc.) has not been started.
 - All edits confined to `DeviceAdapters/SaperaGigE/{SaperaGigE.h,SaperaGigE.cpp}`.
   No DIV bump (adapter-only change).
 - The scratch drafts in the repo root (the two prior PLAN_*.md files) are temporary and
