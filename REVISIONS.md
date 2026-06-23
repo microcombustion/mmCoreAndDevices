@@ -306,15 +306,26 @@ mid-sequence reconfiguration) can only be validated against real camera hardware
 
 ---
 
-## Checkpoint 3 — Cleanup & hardening.
+## Checkpoint 3 — Cleanup & hardening. DONE.
 
-- Remove the now-unused `SequenceThread` class (`SaperaGigE.h:169-192`), the `thd_`
-  member, its construction/teardown, and the commented snap-loop `svc()` (cpp:1136).
-- Remove leftover commented-out blocks (e.g. cpp:632-642) and the dead
-  `GetNominalPixelSizeUm()` if confirmed unused.
-- Re-confirm no override collides with a removed/`final` `MM::Camera` member.
+- Removed the now-unused `SequenceThread` class, the `friend class SequenceThread;`
+  forward-declaration, the `thd_` member and its construction in `Initialize()`, and the
+  `SequenceThread::svc()` implementation (including its dead `InsertImage()`-via-thread
+  call path). The private `InsertImage()` helper on `SaperaGigE` was also removed: its own
+  comment noted it was retained only for the (now-deleted) `SequenceThread`, and the
+  streaming path already inlines the same logic directly in `XferCallback`.
+- Removed the leftover commented-out `StartSequenceAcquisition` block (former cpp:637-649)
+  and the dead `GetNominalPixelSizeUm()` (confirmed: grep shows zero references anywhere in
+  the adapter besides its own declaration, and the symbol does not exist in the current
+  `MM::Camera`/`CCameraBase` interface at all, so it overrides nothing).
+- Re-confirmed no override collides with a removed/`final` `MM::Camera` member (grep for
+  `PrepareSequenceAcqusition`/`GetPixelSizeUm`/`GetComponentName`/`GetNominalPixelSizeUm`/
+  `SequenceThread`/`thd_` across `SaperaGigE.{h,cpp}` returns nothing).
+- **Build-verified** on the Windows + Sapera LT SDK box: `msbuild SaperaGigE.sln
+  /t:Rebuild /p:Configuration=Debug /p:Platform=x64` — 0 warnings, 0 errors, same as the
+  Checkpoint 2 build.
 
-Each bullet is independent and keeps the build green.
+Each bullet was independent and kept the build green throughout.
 
 ---
 
@@ -363,13 +374,14 @@ hardware. Below is the by-inspection verification this build confirms:
 
 ## Scope notes
 
-- Checkpoint 1 is compile-green; Checkpoint 2 is implemented and now **build-verified** on the
-  Windows + Sapera LT SDK box (`msbuild .../SaperaGigE.sln /t:Rebuild`, 0 warnings/errors,
-  real SDK headers/libs — see Verification). B1/B2 were resolved by SDK inspection and the
-  build confirms the signatures bind; B3 remains a closed adapter-side audit (guards are in
-  place in the current code). Remaining gap is **behavioral** correctness on real camera
-  hardware (frame integrity, clean stop, no mid-sequence reconfiguration) — not yet done.
-  Checkpoint 3 (cleanup: dead `SequenceThread`, etc.) has not been started.
+- Checkpoints 1, 2, and 3 are all implemented and **build-verified** on the Windows +
+  Sapera LT SDK box (`msbuild .../SaperaGigE.sln /t:Rebuild`, 0 warnings/errors, real SDK
+  headers/libs — see Verification). B1/B2 were resolved by SDK inspection and the build
+  confirms the signatures bind; B3 is a closed adapter-side audit (guards are in the current
+  code). Checkpoint 3's cleanup (dead `SequenceThread`/`thd_`/`InsertImage()` helper,
+  stale comment block, dead `GetNominalPixelSizeUm()`) is done. Remaining gap is
+  **behavioral** correctness on real camera hardware (frame integrity, clean stop, no
+  mid-sequence reconfiguration) — not yet done; that is the only step left in this plan.
 - All edits confined to `DeviceAdapters/SaperaGigE/{SaperaGigE.h,SaperaGigE.cpp}`.
   No DIV bump (adapter-only change).
 - The scratch drafts in the repo root (the two prior PLAN_*.md files) are temporary and

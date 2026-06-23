@@ -42,8 +42,6 @@
 //
 #define ERR_UNKNOWN_MODE         102
 
-class SequenceThread;
-
 const char* g_CameraDeviceName = "Sapera GigE camera adapter";
 const char* g_CameraServer = "AcquisitionDevice";
 
@@ -104,10 +102,6 @@ public:
     // reported solely through IsCapturing() -- do NOT "fix" Busy() to track the sequence.
     bool Busy() { return false; }
 
-    // pixel-size-related functions
-    // the GenICam spec and the JAI sdk have no way to query sensor pixel size.
-    double GetNominalPixelSizeUm() const { return 1.0; }
-
     int GetBinning() const;
     int SetBinning(int binSize);
     int IsExposureSequenceable(bool& seq) const { seq = false; return DEVICE_OK; }
@@ -131,7 +125,6 @@ public:
 
 private:
 
-    friend class SequenceThread;
     static const int MAX_BIT_DEPTH = 12;
 
     // img_ is the single staging buffer shared by snap (GetImageBuffer) and the
@@ -141,7 +134,6 @@ private:
     // straight to InsertImage). A maintainer must not read img_ from the MMCore thread
     // while a sequence is running.
     ImgBuffer img_;
-    SequenceThread* thd_;
     int bytesPerPixel_;
     int bitsPerPixel_;
     bool initialized_;
@@ -155,7 +147,6 @@ private:
 
     int ResizeImageBuffer();
     void GenerateImage();
-    int InsertImage();
 
     std::vector<std::string> acqDeviceList_;
     std::string activeDevice_;
@@ -178,32 +169,6 @@ private:
     int SynchronizeBuffers(std::string pixelFormat = "", int width = -1, int height = -1, double timeout = -1.);
     long CheckValue(const char*, long);
     static void XferCallback(SapXferCallbackInfo*);
-};
-
-//threading stuff.  Tread lightly
-class SequenceThread : public MMDeviceThreadBase
-{
-public:
-    SequenceThread(SaperaGigE* pCam) : stop_(false), numImages_(0) { camera_ = pCam; }
-    ~SequenceThread() {}
-
-    int svc(void);
-
-    void Stop() { stop_ = true; }
-
-    void Start()
-    {
-        stop_ = false;
-        activate();
-    }
-
-    void SetLength(long images) { numImages_ = images; }
-    long GetLength(void) { return numImages_; };
-
-private:
-    SaperaGigE* camera_;
-    bool stop_;
-    long numImages_;
 };
 
 #endif //_SaperaGigE_H_

@@ -94,7 +94,6 @@ SaperaGigE::SaperaGigE() :
     bytesPerPixel_(1),
     bitsPerPixel_(8),
     initialized_(false),
-    thd_(0),
     sequenceStarted_(false),
     imageCounter_(0),
     Roi_(NULL)
@@ -229,8 +228,6 @@ int SaperaGigE::Initialize()
 
     //CPropertyAction* pAct;
     int ret;
-    // create live video thread
-    thd_ = new SequenceThread(this);
 
     LogMessage((std::string)"Initialize device '" + activeDevice_ + "'");
     SapLocation loc_(activeDevice_.c_str());
@@ -634,20 +631,6 @@ int SaperaGigE::SetBinning(int binF)
     return SetProperty(MM::g_Keyword_Binning, CDeviceUtils::ConvertToString(binF));
 }
 
-//i/**
-// * Required by the MM::Camera API
-// * Please implement this yourself and do not rely on the base class implementation
-// * The Base class implementation is deprecated and will be removed shortly
-// */
-////int SaperaGigE::StartSequenceAcquisition(double interval_ms)
-//int SaperaGigE::StartSequenceAcquisition(long numImages, double interval_ms, bool stopOnOverflow);
-//{
-//    //@TODO: Implement Sequence Acquisition
-//    return DEVICE_ERR;
-//    //int ret = StartSequenceAcquisition((long)(interval_ms/exposureMs_), interval_ms, true);
-//    //return ret;
-//}
-
 /**
 * Stop a running sequence acquisition.
 * This is the single teardown path for streaming: it is the only place that flips
@@ -729,16 +712,6 @@ int SaperaGigE::StartSequenceAcquisition(long numImages, double interval_ms, boo
     imageCounter_ = 0;
     sequenceStarted_ = true;
     return DEVICE_OK;
-}
-
-/*
- * Inserts the current staging buffer into the MMCore circular buffer.
- * Retained only for the (now-dead) SequenceThread, which is deleted in Checkpoint 3;
- * the streaming path inlines this logic in XferCallback.
- */
-int SaperaGigE::InsertImage()
-{
-    return GetCoreCallback()->InsertImage(this, img_.GetPixels(), GetImageWidth(), GetImageHeight(), GetImageBytesPerPixel());
 }
 
 bool SaperaGigE::IsCapturing() {
@@ -1237,35 +1210,4 @@ int SaperaGigE::SetUpBinningProperties()
     }
 
     return SetAllowedValues(MM::g_Keyword_Binning, binValues);
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// Threading methods
-///////////////////////////////////////////////////////////////////////////////
-
-int SequenceThread::svc()
-{
-    //SapManager::DisplayMessage("SequenceThread Start");
-    long count(0);
-    while (!stop_)//&& count < numImages_)
-    {
-        /*int ret = camera_->SnapImage();
-        if (ret != DEVICE_OK)
-        {
-            //SapManager::DisplayMessage("SequenceThread Snap failed");
-           camera_->StopSequenceAcquisition();
-           return 1;
-        }*/
-
-        int ret = camera_->InsertImage();
-        if (ret != DEVICE_OK)
-        {
-            //SapManager::DisplayMessage("SequenceThread InsertFailed");
-            camera_->StopSequenceAcquisition();
-            return 1;
-        }
-        //count++;
-    }
-    //SapManager::DisplayMessage("SequenceThread End");
-    return 0;
 }
