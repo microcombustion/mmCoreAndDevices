@@ -83,6 +83,7 @@ public:
     unsigned GetImageWidth() const;
     unsigned GetImageHeight() const;
     unsigned GetImageBytesPerPixel() const;
+    unsigned GetNumberOfComponents() const;
     unsigned GetBitDepth() const;
     long GetImageBufferSize() const;
     double GetExposure() const;
@@ -164,9 +165,20 @@ private:
     // (see AddPair() in the Sapera++ SDK), so assigning from a temporary leaves that
     // pointer dangling the moment the temporary is destroyed at the end of the statement.
     SapBufferWithTrash* Buffers_;
+    // Roi_ is a child of Buffers_ (its parent), rebuilt every SynchronizeBuffers() call --
+    // unlike Buffers_/AcqDeviceToBuf_ it is NOT construct-once. Still must go through the
+    // same Create()/Destroy() discipline (Create() after Buffers_->Create(), Destroy()
+    // before Buffers_->Destroy()/delete) every single SDK demo uses for SapBufferRoi.
+    // Skipping this left it dangling against an already-destroyed Buffers_ on Shutdown().
     SapBufferRoi* Roi_;
     SapAcqDeviceToBuf* AcqDeviceToBuf_;
     SapTransfer* Xfer_;
+    // Set once in Initialize() from AcqDevice_.IsRawBayerOutput() (the same call Sapera's
+    // own CamExpert/demo apps use to detect a color sensor). When true, SynchronizeBuffers()
+    // constructs Conv_ with the same construct-once/Destroy()-Create()-in-place discipline
+    // as Buffers_/AcqDeviceToBuf_ above -- same dangling-pointer hazard applies.
+    bool isColor_;
+    SapColorConversion* Conv_;
     SapLocation loc_;
     SapFeature AcqFeature_;
 

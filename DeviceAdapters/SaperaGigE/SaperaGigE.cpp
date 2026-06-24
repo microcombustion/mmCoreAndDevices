@@ -99,7 +99,9 @@ SaperaGigE::SaperaGigE() :
     Buffers_(NULL),
     Roi_(NULL),
     AcqDeviceToBuf_(NULL),
-    Xfer_(NULL)
+    Xfer_(NULL),
+    isColor_(false),
+    Conv_(NULL)
 {
 
     // call the base class method to set-up default error codes/messages
@@ -252,6 +254,11 @@ int SaperaGigE::Initialize()
     }
 
     NumberOfWorkableCameras_++;
+
+    // Detect a color sensor the same way Sapera's own CamExpert/demo apps do, so
+    // SynchronizeBuffers() knows whether to set up Bayer->RGB conversion.
+    isColor_ = AcqDevice_.IsRawBayerOutput();
+    CreateProperty("CameraColorType", isColor_ ? "Color" : "Monochrome", MM::String, true);
 
     // set up feature type correspondence
     std::map<SapFeature::Type, MM::PropertyType> featureTypes;
@@ -429,6 +436,10 @@ int SaperaGigE::FreeHandles()
 {
     LogMessage((std::string)"Destroy Sapera buffers and devices");
     if (Xfer_ && *Xfer_ && !Xfer_->Destroy()) return DEVICE_ERR;
+    if (Conv_ && *Conv_ && !Conv_->Destroy()) return DEVICE_ERR;
+    // Roi_ is a child object of Buffers_ -- must be destroyed/deleted before its parent
+    // (same ordering the SDK's own demos use for SapBufferRoi).
+    if (Roi_ && *Roi_ && !Roi_->Destroy()) return DEVICE_ERR;
     if (Buffers_ && !Buffers_->Destroy()) return DEVICE_ERR;
     if (!AcqFeature_.Destroy()) return DEVICE_ERR;
     if (!AcqDevice_.Destroy()) return DEVICE_ERR;
@@ -438,6 +449,10 @@ int SaperaGigE::FreeHandles()
     delete AcqDeviceToBuf_;
     AcqDeviceToBuf_ = NULL;
     Xfer_ = NULL;
+    delete Conv_;
+    Conv_ = NULL;
+    delete Roi_;
+    Roi_ = NULL;
     delete Buffers_;
     Buffers_ = NULL;
     return DEVICE_OK;
@@ -485,8 +500,16 @@ int SaperaGigE::SnapImage()
 */
 const unsigned char* SaperaGigE::GetImageBuffer()
 {
+    // For a color sensor, demosaic the just-acquired raw Bayer buffer into Conv_'s RGB
+    // output buffer before reading pixels out of it.
+    SapBuffer* src = Buffers_;
+    if (isColor_)
+    {
+        Conv_->Convert();
+        src = Conv_->GetOutputBuffer();
+    }
     // Put Sapera buffer into Micro-Manager Buffer
-    Buffers_->ReadRect(Roi_->GetXMin(), Roi_->GetYMin(), img_.Width(), img_.Height(),
+    src->ReadRect(Roi_->GetXMin(), Roi_->GetYMin(), img_.Width(), img_.Height(),
         const_cast<unsigned char*>(img_.GetPixels()));
     // Return location of the Micro-Manager Buffer
     return const_cast<unsigned char*>(img_.GetPixels());
@@ -517,6 +540,16 @@ unsigned SaperaGigE::GetImageHeight() const
 unsigned SaperaGigE::GetImageBytesPerPixel() const
 {
     return img_.Depth();
+}
+
+/**
+* Returns the number of components (1 for monochrome, 4 for the 32-bit BGRA
+* produced by Conv_ on a detected color sensor).
+* Required by the MM::Camera API.
+*/
+unsigned SaperaGigE::GetNumberOfComponents() const
+{
+    return isColor_ ? 4 : 1;
 }
 
 /**
@@ -1066,10 +1099,18 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
     // before tearing down here.
     if (Roi_ != NULL)
     {
+        // Roi_ is a child object of Buffers_ (its parent) -- like every other Sapera SDK
+        // object here, it must be Destroy()'d while still valid, before the buffer it
+        // wraps is torn down. See the Roi_ declaration in the header for why skipping this
+        // is unsafe.
+        if (!Roi_->Destroy())
+            LogMessage("Failed to destroy Sapera ROI object");
         delete Roi_;
         Roi_ = NULL;
         if (!Xfer_->Destroy())
             LogMessage("Failed to destroy Sapera transfer object");
+        if (Conv_ && !Conv_->Destroy())
+            LogMessage("Failed to destroy Sapera color conversion object");
         if (!Buffers_->Destroy())
             LogMessage("Failed to destroy Sapera buffer object");
     }
@@ -1087,24 +1128,62 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
     // synchronize bit depth with camera
     AcqDevice_.GetFeatureValue("PixelSize", &bitsPerPixel_);
     bytesPerPixel_ = (bitsPerPixel_ + 7) / 8;
+    if (isColor_)
+        bytesPerPixel_ = 4; // Conv_ always normalizes to 32-bit BGRA (SapFormatRGB8888)
 
-    // Construct the buffer/transfer objects exactly once (count and source device never
-    // change between calls); every later reconfiguration only Destroy()s/Create()s them in
-    // place. Never reassign these from a freshly-constructed temporary -- see the warning
-    // on the Buffers_/AcqDeviceToBuf_ declarations in the header.
+    // Construct the buffer/transfer/conversion objects exactly once (count and source
+    // device never change between calls); every later reconfiguration only
+    // Destroy()s/Create()s them in place. Never reassign these from a freshly-constructed
+    // temporary -- see the warning on the Buffers_/AcqDeviceToBuf_/Conv_ declarations in
+    // the header.
     if (Buffers_ == NULL)
     {
         Buffers_ = new SapBufferWithTrash(3, &AcqDevice_);
         AcqDeviceToBuf_ = new SapAcqDeviceToBuf(&AcqDevice_, Buffers_, XferCallback, this);
         Xfer_ = AcqDeviceToBuf_;
     }
+    if (isColor_ && Conv_ == NULL)
+        Conv_ = new SapColorConversion(&AcqDevice_, Buffers_);
     Roi_ = new SapBufferRoi(Buffers_);
+    if (isColor_)
+    {
+        // Per the SDK's own GigEBayerDemo: Enable() may need to modify the acquisition's
+        // output format, so it must run before the buffer is created. SetAlign()/
+        // SetOutputFormat() are the opposite -- the SDK rejects them ("cannot be called
+        // before the Create method") until Conv_->Create() has run, so those are deferred
+        // until after Conv_->Create() below.
+        if (!Conv_->Enable(TRUE, FALSE))
+        {
+            LogMessage("Color conversion not supported on this camera; falling back to raw passthrough");
+            isColor_ = false;
+            bytesPerPixel_ = (bitsPerPixel_ + 7) / 8;
+        }
+    }
     if (!Buffers_->Create())
     {
         int ret = FreeHandles();
         if (ret != DEVICE_OK)
             return ret;
         return DEVICE_NATIVE_MODULE_FAILED;
+    }
+    if (!Roi_->Create())
+    {
+        int ret = FreeHandles();
+        if (ret != DEVICE_OK)
+            return ret;
+        return DEVICE_NATIVE_MODULE_FAILED;
+    }
+    if (isColor_ && !Conv_->Create())
+    {
+        int ret = FreeHandles();
+        if (ret != DEVICE_OK)
+            return ret;
+        return DEVICE_NATIVE_MODULE_FAILED;
+    }
+    if (isColor_)
+    {
+        Conv_->SetAlign(SapColorConversion::GetAlignModeFromAcqDevice(&AcqDevice_));
+        Conv_->SetOutputFormat(SapFormatRGB8888);
     }
     if (Xfer_ && !Xfer_->Create())
     {
@@ -1149,9 +1228,18 @@ void SaperaGigE::XferCallback(SapXferCallbackInfo* pInfo)
         return;
     }
 
+    // For a color sensor, demosaic the just-completed raw Bayer buffer into Conv_'s RGB
+    // output buffer before reading pixels out of it.
+    SapBuffer* src = self->Buffers_;
+    if (self->isColor_)
+    {
+        self->Conv_->Convert();
+        src = self->Conv_->GetOutputBuffer();
+    }
+
     // Read the just-completed buffer (the no-index ReadRect reads at GetIndex(), the last
     // grabbed buffer) into the single staging buffer img_, then push to the core.
-    self->Buffers_->ReadRect(self->Roi_->GetXMin(), self->Roi_->GetYMin(),
+    src->ReadRect(self->Roi_->GetXMin(), self->Roi_->GetYMin(),
         self->img_.Width(), self->img_.Height(),
         const_cast<unsigned char*>(self->img_.GetPixels()));
     int ret = self->GetCoreCallback()->InsertImage(self, self->img_.GetPixels(),
