@@ -157,10 +157,15 @@ private:
     int GetListOfAvailableCameras();
     SapAcqDevice AcqDevice_;
     SapAcqDevice CurrentDevice_;
-    SapBufferWithTrash Buffers_;
+    // Buffers_/AcqDeviceToBuf_ are constructed exactly once (in SynchronizeBuffers(), on
+    // first call) and torn down via Destroy()/Create() in place from then on. Never
+    // reassign them from a freshly-constructed temporary: SapAcqDeviceToBuf's constructor
+    // registers a transfer pair that stores a pointer back to the constructed instance
+    // (see AddPair() in the Sapera++ SDK), so assigning from a temporary leaves that
+    // pointer dangling the moment the temporary is destroyed at the end of the statement.
+    SapBufferWithTrash* Buffers_;
     SapBufferRoi* Roi_;
-    SapTransfer AcqToBuf_;
-    SapTransfer AcqDeviceToBuf_;
+    SapAcqDeviceToBuf* AcqDeviceToBuf_;
     SapTransfer* Xfer_;
     SapLocation loc_;
     SapFeature AcqFeature_;

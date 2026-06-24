@@ -96,7 +96,10 @@ SaperaGigE::SaperaGigE() :
     initialized_(false),
     sequenceStarted_(false),
     imageCounter_(0),
-    Roi_(NULL)
+    Buffers_(NULL),
+    Roi_(NULL),
+    AcqDeviceToBuf_(NULL),
+    Xfer_(NULL)
 {
 
     // call the base class method to set-up default error codes/messages
@@ -426,9 +429,17 @@ int SaperaGigE::FreeHandles()
 {
     LogMessage((std::string)"Destroy Sapera buffers and devices");
     if (Xfer_ && *Xfer_ && !Xfer_->Destroy()) return DEVICE_ERR;
-    if (!Buffers_.Destroy()) return DEVICE_ERR;
+    if (Buffers_ && !Buffers_->Destroy()) return DEVICE_ERR;
     if (!AcqFeature_.Destroy()) return DEVICE_ERR;
     if (!AcqDevice_.Destroy()) return DEVICE_ERR;
+    // Full teardown (paired with the AcqDevice_/AcqFeature_ destroy above): a later
+    // Initialize() rebuilds these from scratch via SynchronizeBuffers(), so it is safe to
+    // delete the persistent objects here.
+    delete AcqDeviceToBuf_;
+    AcqDeviceToBuf_ = NULL;
+    Xfer_ = NULL;
+    delete Buffers_;
+    Buffers_ = NULL;
     return DEVICE_OK;
 }
 
@@ -475,7 +486,7 @@ int SaperaGigE::SnapImage()
 const unsigned char* SaperaGigE::GetImageBuffer()
 {
     // Put Sapera buffer into Micro-Manager Buffer
-    Buffers_.ReadRect(Roi_->GetXMin(), Roi_->GetYMin(), img_.Width(), img_.Height(),
+    Buffers_->ReadRect(Roi_->GetXMin(), Roi_->GetYMin(), img_.Width(), img_.Height(),
         const_cast<unsigned char*>(img_.GetPixels()));
     // Return location of the Micro-Manager Buffer
     return const_cast<unsigned char*>(img_.GetPixels());
@@ -1049,11 +1060,18 @@ void SaperaGigE::GenerateImage()
 int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int height, double timeout)
 {
     // destroy transfer and buffer
+    // Callers only reach here with the transfer idle: OnPixelType/OnWidth/OnHeight etc.
+    // reject via IsCapturing() while a sequence is running, and SnapImage() already blocks
+    // on Wait() before returning. So no Freeze()/Wait() is needed (or safe to assume armed)
+    // before tearing down here.
     if (Roi_ != NULL)
     {
         delete Roi_;
-        Xfer_->Destroy();
-        Buffers_.Destroy();
+        Roi_ = NULL;
+        if (!Xfer_->Destroy())
+            LogMessage("Failed to destroy Sapera transfer object");
+        if (!Buffers_->Destroy())
+            LogMessage("Failed to destroy Sapera buffer object");
     }
 
     // default value
@@ -1070,12 +1088,18 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
     AcqDevice_.GetFeatureValue("PixelSize", &bitsPerPixel_);
     bytesPerPixel_ = (bitsPerPixel_ + 7) / 8;
 
-    // re-create  transfer and buffer
-    Buffers_ = SapBufferWithTrash(3, &AcqDevice_);
-    Roi_ = new SapBufferRoi(&Buffers_);
-    AcqDeviceToBuf_ = SapAcqDeviceToBuf(&AcqDevice_, &Buffers_, XferCallback, this);
-    Xfer_ = &AcqDeviceToBuf_;
-    if (!Buffers_.Create())
+    // Construct the buffer/transfer objects exactly once (count and source device never
+    // change between calls); every later reconfiguration only Destroy()s/Create()s them in
+    // place. Never reassign these from a freshly-constructed temporary -- see the warning
+    // on the Buffers_/AcqDeviceToBuf_ declarations in the header.
+    if (Buffers_ == NULL)
+    {
+        Buffers_ = new SapBufferWithTrash(3, &AcqDevice_);
+        AcqDeviceToBuf_ = new SapAcqDeviceToBuf(&AcqDevice_, Buffers_, XferCallback, this);
+        Xfer_ = AcqDeviceToBuf_;
+    }
+    Roi_ = new SapBufferRoi(Buffers_);
+    if (!Buffers_->Create())
     {
         int ret = FreeHandles();
         if (ret != DEVICE_OK)
@@ -1127,7 +1151,7 @@ void SaperaGigE::XferCallback(SapXferCallbackInfo* pInfo)
 
     // Read the just-completed buffer (the no-index ReadRect reads at GetIndex(), the last
     // grabbed buffer) into the single staging buffer img_, then push to the core.
-    self->Buffers_.ReadRect(self->Roi_->GetXMin(), self->Roi_->GetYMin(),
+    self->Buffers_->ReadRect(self->Roi_->GetXMin(), self->Roi_->GetYMin(),
         self->img_.Width(), self->img_.Height(),
         const_cast<unsigned char*>(self->img_.GetPixels()));
     int ret = self->GetCoreCallback()->InsertImage(self, self->img_.GetPixels(),
