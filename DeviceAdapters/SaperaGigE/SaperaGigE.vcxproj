@@ -44,7 +44,9 @@
     <Import Project="..\..\buildscripts\VisualStudio\MMDeviceAdapter.props" />
     <Import Project="..\..\buildscripts\VisualStudio\MMCommon.props" />
   </ImportGroup>
-  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Label="UserMacros">
+    <SAPERADIR Condition="'$(SAPERADIR)'==''">$(MM_3RDPARTYPRIVATE)\Sapera</SAPERADIR>
+  </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
   </PropertyGroup>

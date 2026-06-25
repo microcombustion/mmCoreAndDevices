@@ -3,9 +3,9 @@
 // PROJECT:       Micro-Manager
 // SUBSYSTEM:     DeviceAdapters
 //-------------------------------------------------------
-// DESCRIPTION:   An adapter for Gigbit-Ethernet cameras using an
-//                SDK from JAI, Inc.  Users and developers will
-//                need to download and install the JAI SDK and control tool.
+// DESCRIPTION:   Device adapter for GigE Vision cameras exposed through the
+//                Teledyne DALSA Sapera LT / Sapera++ SDK. Users and developers
+//                need a compatible Sapera SDK/runtime installation.
 //
 // AUTHOR:        Robert Frazee, rfraze1@lsu.edu
 //                Ingmar Schoegl, ischoegl@lsu.edu
@@ -82,13 +82,9 @@ int ErrorBox(std::string text, std::string caption)
 
 /**
 * SaperaGigE constructor.
-* Setup default all variables and create device properties required to exist
-* before intialization. In this case, no such properties were required. All
-* properties will be created in the Initialize() method.
-*
-* As a general guideline Micro-Manager devices do not access hardware in the
-* the constructor. We should do as little as possible in the constructor and
-* perform most of the initialization in the Initialize() method.
+* Initializes Micro-Manager defaults and enumerates Sapera acquisition servers
+* to create the pre-initialization camera-selection property. Sapera device,
+* buffer, and transfer objects are created later in Initialize().
 */
 SaperaGigE::SaperaGigE() :
     bytesPerPixel_(1),
@@ -147,10 +143,10 @@ int SaperaGigE::GetListOfAvailableCameras()
 {
     CreateProperty(MM::g_Keyword_Name, g_CameraDeviceName, MM::String, true);
 
-    // Sapera++ library stuff
+    // Query Sapera acquisition servers and expose them as selectable camera endpoints.
     if (!(SapManager::DetectAllServers(SapManager::DetectServerAll)))
     {
-        LogMessage("No CameraLink camera servers detected", false);
+        LogMessage("No Sapera acquisition servers detected", false);
         return DEVICE_NOT_CONNECTED;
     }
 
@@ -637,7 +633,8 @@ long SaperaGigE::GetImageBufferSize() const
 * exact dimensions requested - but should try do as close as possible.
 * If the hardware does not have this capability the software should simulate the ROI by
 * appropriately cropping each frame.
-* This demo implementation ignores the position coordinates and just crops the buffer.
+* This adapter rebuilds the Sapera ROI/buffer/transfer chain so the Micro-Manager
+* image buffer matches the requested ROI.
 * @param x - top-left corner coordinate
 * @param y - top-left corner coordinate
 * @param xSize - width
@@ -866,7 +863,7 @@ int SaperaGigE::StartSequenceAcquisition(long numImages, double interval_ms, boo
         stopRequested_ = false;
     }
 
-    // Start the transfer first (Aravis order); only arm the sequence on success.
+    // Start the Sapera transfer first; only arm the Micro-Manager sequence on success.
     if (!Xfer_->Grab())
     {
         LogMessage("Failed to start continuous acquisition");
@@ -1464,7 +1461,7 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
  * when the transfer finishes a frame. This is the streaming path -- it paces frames to
  * intervalMs_, reads the just-completed buffer, tags it with the correct component count,
  * and pushes it into the MMCore circular buffer. On a finite-length completion or an
- * InsertImage() error it calls RequestStop() -- it NEVER calls Freeze()/Wait()/AcqFinished()
+ * InsertImage() error it calls RequestStop() -- it does not call Freeze()/Wait()/AcqFinished()
  * itself; Sapera serializes transfer callbacks, so blocking on this same transfer's Wait()
  * from in here risks deadlock. Actual teardown runs on the stop worker thread
  * (performTeardown_()).
@@ -1613,16 +1610,10 @@ int SaperaGigE::SetUpBinningProperties()
 }
 
 /**
-* Sets up "AcquisitionFrameRate" as a real, writable property (per HOT_CAMERA.md) so a
-* capable camera can cap hardware readout. Self-contained and fail-soft, modeled on
-* SetUpBinningProperties(): unlike the generic deviceFeatures loop in Initialize() (which
-* would fail Initialize() on a GetFeatureValue error), every failure path here just logs and
-* returns DEVICE_OK, skipping the property -- absence of frame-rate control on a given
-* camera must never prevent the device from initializing.
-* "AcquisitionFrameRate"/"AcquisitionFrameRateEnable"/"AcquisitionFrameRateControlMode" are
-* standard GenICam SFNC names but are defined by each camera's own GenICam XML, not by the
-* Sapera SDK -- they could not be found anywhere in the local SDK install, so this is
-* genuinely untested against real hardware.
+* Sets up "AcquisitionFrameRate" as a best-effort GenICam/SFNC property when
+* the connected camera exposes it through Sapera. Absence of this feature is
+* normal for some cameras or configurations, so failures here are logged and
+* initialization continues without the property.
 */
 int SaperaGigE::SetUpFrameRateProperty()
 {

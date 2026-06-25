@@ -3,9 +3,9 @@
 // PROJECT:       Micro-Manager
 // SUBSYSTEM:     DeviceAdapters
 //-------------------------------------------------------
-// DESCRIPTION:   An adapter for Gigbit-Ethernet cameras using an
-//                SDK from JAI, Inc.  Users and developers will
-//                need to download and install the JAI SDK and control tool.
+// DESCRIPTION:   Device adapter for GigE Vision cameras exposed through the
+//                Teledyne DALSA Sapera LT / Sapera++ SDK. Users and developers
+//                need a compatible Sapera SDK/runtime installation.
 //
 // AUTHOR:        Robert Frazee, rfraze1@lsu.edu
 //                Ingmar Schoegl, ischoegl@lsu.edu
@@ -80,8 +80,8 @@ public:
 
     void GetName(char* name) const;
 
-    // SaperaGigE API
-    // ------------
+    // MM::Camera API
+    // --------------
     int SnapImage();
     const unsigned char* GetImageBuffer();
     unsigned GetImageWidth() const;
@@ -137,7 +137,7 @@ private:
     static const int MAX_BIT_DEPTH = 12;
 
     // img_ is the single staging buffer shared by snap (GetImageBuffer) and the
-    // streaming XferCallback. During a sequence, ONLY the callback writes img_: snap is
+    // streaming XferCallback. During a sequence, only the callback writes img_: snap is
     // rejected (sequenceStarted_), buffer-resizing property changes are rejected (the
     // OnXxx guards), and GetImageBuffer() is not on the streaming path (frames go
     // straight to InsertImage). A maintainer must not read img_ from the MMCore thread
@@ -162,7 +162,7 @@ private:
     // Freeze()/Wait()/AcqFinished() from inside XferCallback -- Sapera serializes transfer
     // callbacks, so blocking on the same transfer's Wait() there risks deadlock (see the
     // callback's own comment). RequestStop() instead signals this worker thread, which runs
-    // performTeardown_() off the callback thread. stopRequested_ is guarded SOLELY by
+    // performTeardown_() off the callback thread. stopRequested_ is guarded only by
     // stopMutex_ -- never by seqLock_ -- so the worker's wait/notify can never miss a signal.
     std::thread stopWorker_;
     std::atomic<bool> stopRequested_;
