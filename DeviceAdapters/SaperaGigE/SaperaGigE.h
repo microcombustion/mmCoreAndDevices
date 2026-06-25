@@ -125,6 +125,8 @@ public:
     int OnTemperature(MM::PropertyBase* pProp, MM::ActionType eAct);
     int OnPixelType(MM::PropertyBase* pProp, MM::ActionType eAct);
     int OnGain(MM::PropertyBase* pProp, MM::ActionType eAct);
+    int OnBlackLevelSelector(MM::PropertyBase* pProp, MM::ActionType eAct);
+    int OnBlackLevel(MM::PropertyBase* pProp, MM::ActionType eAct);
     int OnExposure(MM::PropertyBase* pProp, MM::ActionType eAct);
     int OnAcquisitionFrameRate(MM::PropertyBase* pProp, MM::ActionType eAct);
     int OnCamera(MM::PropertyBase* pProp, MM::ActionType eAct);//for multiple camera support

@@ -313,9 +313,12 @@ int SaperaGigE::Initialize()
     deviceFeatures["CameraMacAddress"] = define_feature("deviceMacAddress", true, NULL);
     deviceFeatures["SensorColorType"] = define_feature("sensorColorType", true, NULL);
     deviceFeatures["SensorPixelCoding"] = define_feature("PixelCoding", true, NULL);
-    deviceFeatures["SensorBlackLevel"] = define_feature("BlackLevel", true, NULL);
+    deviceFeatures["SensorBlackLevelSelector"] = define_feature("BlackLevelSelector", false,
+        new CPropertyAction(this, &SaperaGigE::OnBlackLevelSelector));
+    deviceFeatures["SensorBlackLevel"] = define_feature("BlackLevel", false,
+        new CPropertyAction(this, &SaperaGigE::OnBlackLevel));
     deviceFeatures["SensorPixelInput"] = define_feature("pixelSizeInput", true, NULL);
-    deviceFeatures["SensorShutterMode"] = define_feature("SensorShutterMode", false, NULL);
+    deviceFeatures["SensorShutterMode"] = define_feature("SensorShutterMode", true, NULL);
     deviceFeatures["SensorBinningMode"] = define_feature("binningMode", false,
         new CPropertyAction(this, &SaperaGigE::OnBinningMode));
     deviceFeatures["SensorWidth"] = define_feature("SensorWidth", true, NULL);
@@ -459,14 +462,18 @@ int SaperaGigE::Shutdown()
     if (stopWorker_.joinable())
         stopWorker_.join();
 
-    Xfer_->Freeze();
-    if (!Xfer_->Wait(5000))
-        return DEVICE_NATIVE_MODULE_FAILED;
-    int ret;
-    ret = FreeHandles();
-    if (ret != DEVICE_OK)
-        return ret;
-    return DEVICE_OK;
+    // Guard: after a failed SynchronizeBuffers() rebuild, Xfer_ may be NULL even with
+    // initialized_ true. FreeHandles() is still safe to call (it null-checks everything).
+    if (Xfer_)
+    {
+        Xfer_->Freeze();
+        // Log a timeout but always proceed to FreeHandles(): leaving Sapera kernel objects
+        // live (and cormem.sys holding DMA-locked pages) is exactly the state that produces
+        // a 0x1a/0x1230 BSOD on the next process that initializes the driver.
+        if (!Xfer_->Wait(5000))
+            LogMessage("Timed out waiting for transfer to stop during shutdown");
+    }
+    return FreeHandles();
 }
 
 /**
@@ -475,14 +482,19 @@ int SaperaGigE::Shutdown()
 int SaperaGigE::FreeHandles()
 {
     LogMessage((std::string)"Destroy Sapera buffers and devices");
-    if (Xfer_ && *Xfer_ && !Xfer_->Destroy()) return DEVICE_ERR;
-    if (Conv_ && *Conv_ && !Conv_->Destroy()) return DEVICE_ERR;
-    // Roi_ is a child object of Buffers_ -- must be destroyed/deleted before its parent
-    // (same ordering the SDK's own demos use for SapBufferRoi).
-    if (Roi_ && *Roi_ && !Roi_->Destroy()) return DEVICE_ERR;
-    if (Buffers_ && !Buffers_->Destroy()) return DEVICE_ERR;
-    if (!AcqFeature_.Destroy()) return DEVICE_ERR;
-    if (!AcqDevice_.Destroy()) return DEVICE_ERR;
+    // Accumulate errors but attempt every destroy: an early return on first failure leaves
+    // later kernel objects live, which is exactly the state cormem.sys cannot safely clean
+    // up after a process exit (→ 0x1a/0x1230 BSOD on the next init).
+    int ret = DEVICE_OK;
+    if (Xfer_ && *Xfer_ && !Xfer_->Destroy()) ret = DEVICE_ERR;
+    if (Conv_ && *Conv_ && !Conv_->Destroy()) ret = DEVICE_ERR;
+    // Roi_ (SapBufferRoi child) must be destroyed after Xfer_ but before its parent Buffers_.
+    // Xfer_ holds references to all child buffer handles including Roi_'s m_hTrashChild;
+    // destroying Roi_ while Xfer_ is still live causes cormem.sys to BSOD (0x1230).
+    if (Roi_ && *Roi_ && !Roi_->Destroy()) ret = DEVICE_ERR;
+    if (Buffers_ && !Buffers_->Destroy()) ret = DEVICE_ERR;
+    if (!AcqFeature_.Destroy()) ret = DEVICE_ERR;
+    if (!AcqDevice_.Destroy()) ret = DEVICE_ERR;
     // Full teardown (paired with the AcqDevice_/AcqFeature_ destroy above): a later
     // Initialize() rebuilds these from scratch via SynchronizeBuffers(), so it is safe to
     // delete the persistent objects here.
@@ -495,7 +507,7 @@ int SaperaGigE::FreeHandles()
     Roi_ = NULL;
     delete Buffers_;
     Buffers_ = NULL;
-    return DEVICE_OK;
+    return ret;
 }
 
 /**
@@ -639,15 +651,23 @@ int SaperaGigE::SetROI(unsigned x, unsigned y, unsigned xSize, unsigned ySize)
     LogMessage((std::string)"Setting Region of Interest");
     if (xSize == 0 && ySize == 0)
         return ClearROI();
-    // SapBufferRoi::SetRoi() is a pre-Create()-only call (SDK rejects it after Create()).
-    // Store coordinates and rebuild Roi_ with the new geometry.
+    // Validate against the current full-frame dimensions before tearing down. An out-of-range
+    // ROI would make SapBufferRoi::Create() fail mid-rebuild, leaving the adapter in a broken
+    // state (Xfer_/Roi_ null, initialized_ true). Also catches xSize==0 or ySize==0 alone.
+    UINT32 fullWidth = 0, fullHeight = 0;
+    if (!AcqDevice_.GetFeatureValue("Width", &fullWidth) ||
+        !AcqDevice_.GetFeatureValue("Height", &fullHeight))
+        return DEVICE_ERR;
+    if (xSize == 0 || ySize == 0 ||
+        (UINT32)x + xSize > fullWidth || (UINT32)y + ySize > fullHeight)
+        return DEVICE_INVALID_INPUT_PARAM;
+    // Changing ROI requires a full Sapera chain teardown/rebuild (Roi_ → Xfer_ → Conv_ →
+    // Buffers_). Destroying/creating Roi_ alone while Buffers_ is live causes cormem.sys
+    // to call MmUnmapLockedPages on still-active DMA pages → BSOD. SynchronizeBuffers()
+    // performs the full safe sequence and calls ResizeImageBuffer() at the end, which
+    // (after the update below) uses roiW_/roiH_ to size img_ correctly.
     roiX_ = (int)x; roiY_ = (int)y; roiW_ = (int)xSize; roiH_ = (int)ySize;
-    if (Roi_) { Roi_->Destroy(); delete Roi_; }
-    Roi_ = new SapBufferRoi(Buffers_, roiX_, roiY_, roiW_, roiH_);
-    if (!Roi_->Create())
-        return DEVICE_NATIVE_MODULE_FAILED;
-    img_.Resize(xSize, ySize);
-    return DEVICE_OK;
+    return SynchronizeBuffers();
 }
 
 /**
@@ -656,11 +676,19 @@ int SaperaGigE::SetROI(unsigned x, unsigned y, unsigned xSize, unsigned ySize)
 */
 int SaperaGigE::GetROI(unsigned& x, unsigned& y, unsigned& xSize, unsigned& ySize)
 {
+    // Roi_ can be null if SynchronizeBuffers() failed mid-rebuild; fall back to stored coords.
+    if (!Roi_)
+    {
+        x = (unsigned)roiX_;
+        y = (unsigned)roiY_;
+        xSize = (roiW_ > 0) ? (unsigned)roiW_ : 0;
+        ySize = (roiH_ > 0) ? (unsigned)roiH_ : 0;
+        return DEVICE_OK;
+    }
     x = Roi_->GetXMin();
     y = Roi_->GetYMin();
     xSize = Roi_->GetWidth();
     ySize = Roi_->GetHeight();
-
     return DEVICE_OK;
 }
 
@@ -673,14 +701,9 @@ int SaperaGigE::ClearROI()
     // img_ geometry must stay stable while the callback is streaming into it.
     if (IsCapturing())
         return DEVICE_CAMERA_BUSY_ACQUIRING;
-    // SapBufferRoi::ResetRoi() is pre-Create()-only. Rebuild Roi_ at full-frame geometry.
+    // Same teardown requirement as SetROI: full chain rebuild via SynchronizeBuffers().
     roiX_ = 0; roiY_ = 0; roiW_ = -1; roiH_ = -1;
-    if (Roi_) { Roi_->Destroy(); delete Roi_; }
-    Roi_ = new SapBufferRoi(Buffers_, 0, 0, -1, -1);
-    if (!Roi_->Create())
-        return DEVICE_NATIVE_MODULE_FAILED;
-    ResizeImageBuffer();
-    return DEVICE_OK;
+    return SynchronizeBuffers();
 }
 
 /**
@@ -902,6 +925,7 @@ int SaperaGigE::OnBinning(MM::PropertyBase* pProp, MM::ActionType eAct)
             return DEVICE_ERR;
         if (!AcqDevice_.SetFeatureValue("BinningHorizontal", int(binSize)))
             return DEVICE_ERR;
+        roiX_ = 0; roiY_ = 0; roiW_ = -1; roiH_ = -1;
         return SynchronizeBuffers();
     }
     // MM::BeforeGet returns the value cached in the property.
@@ -1006,6 +1030,7 @@ int SaperaGigE::OnWidth(MM::PropertyBase* pProp, MM::ActionType eAct)
         pProp->Get(value);
 
         value = CheckValue("Width", value);
+        roiX_ = 0; roiY_ = 0; roiW_ = -1; roiH_ = -1;
         int ret = SynchronizeBuffers("", value, -1);
         if (ret != DEVICE_OK)
             return ret;
@@ -1031,6 +1056,7 @@ int SaperaGigE::OnHeight(MM::PropertyBase* pProp, MM::ActionType eAct)
         pProp->Get(value);
 
         value = CheckValue("Height", value);
+        roiX_ = 0; roiY_ = 0; roiW_ = -1; roiH_ = -1;
         int ret = SynchronizeBuffers("", -1, value);
         if (ret != DEVICE_OK)
             return ret;
@@ -1146,6 +1172,57 @@ int SaperaGigE::OnGain(MM::PropertyBase* pProp, MM::ActionType eAct)
     return DEVICE_OK;
 }
 
+int SaperaGigE::OnBlackLevelSelector(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+    if (eAct == MM::AfterSet)
+    {
+        if (IsCapturing())
+            return DEVICE_CAMERA_BUSY_ACQUIRING;
+        std::string value;
+        pProp->Get(value);
+        if (!AcqDevice_.SetFeatureValue("BlackLevelSelector", value.c_str()))
+        {
+            LogMessage("Failed to set feature value for 'BlackLevelSelector'");
+            return DEVICE_ERR;
+        }
+    }
+    else if (eAct == MM::BeforeGet)
+    {
+        char value[MM::MaxStrLength];
+        if (!AcqDevice_.GetFeatureValue("BlackLevelSelector", value, sizeof(value)))
+        {
+            LogMessage("Failed to get feature value for 'BlackLevelSelector'");
+            return DEVICE_ERR;
+        }
+        pProp->Set(value);
+    }
+    return DEVICE_OK;
+}
+
+int SaperaGigE::OnBlackLevel(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+    double level;
+    if (eAct == MM::AfterSet)
+    {
+        pProp->Get(level);
+        if (!AcqDevice_.SetFeatureValue("BlackLevel", level))
+        {
+            LogMessage("Failed to set feature value for 'BlackLevel'");
+            return DEVICE_ERR;
+        }
+    }
+    else if (eAct == MM::BeforeGet)
+    {
+        if (!AcqDevice_.GetFeatureValue("BlackLevel", &level))
+        {
+            LogMessage("Failed to get feature value for 'BlackLevel'");
+            return DEVICE_ERR;
+        }
+        pProp->Set(level);
+    }
+    return DEVICE_OK;
+}
+
 int SaperaGigE::OnExposure(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
     // note that GigE units of exposure are us; umanager uses ms
@@ -1225,7 +1302,12 @@ int SaperaGigE::ResizeImageBuffer()
     if (!AcqDevice_.GetFeatureValue("Width", &width))
         return DEVICE_INVALID_PROPERTY;
 
-    img_.Resize(width, height, bytesPerPixel_);
+    // When a software ROI is active, img_ must match the ROI dimensions so that
+    // XferCallback's ReadRect(roiX_, roiY_, img_.Width(), img_.Height(), ...) reads only
+    // the ROI region. Full-frame when roiW_/roiH_ are -1 (no active ROI).
+    unsigned roiWidth  = (roiW_ > 0) ? (unsigned)roiW_ : width;
+    unsigned roiHeight = (roiH_ > 0) ? (unsigned)roiH_ : height;
+    img_.Resize(roiWidth, roiHeight, bytesPerPixel_);
 
     return DEVICE_OK;
 }
@@ -1255,18 +1337,21 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
     // before tearing down here.
     if (Roi_ != NULL)
     {
-        // Roi_ is a child object of Buffers_ (its parent) -- like every other Sapera SDK
-        // object here, it must be Destroy()'d while still valid, before the buffer it
-        // wraps is torn down. See the Roi_ declaration in the header for why skipping this
-        // is unsafe.
+        // SDK teardown order matches MultiBoardSyncGrabDemo's DestroyObjects(): Xfer first,
+        // then ROI child, then parent buffer -- exact reverse of Create() order.
+        // SapBufferRoi has its own m_hTrashChild CORBUFFER; the Xfer holds references to
+        // all child buffer handles, so Roi_->Destroy() must not run while Xfer_ is live.
+        // Freeze()+Wait() ensures DMA is idle before touching the chain; mirrors Shutdown().
+        Xfer_->Freeze();
+        Xfer_->Wait(5000);
+        if (Xfer_ && *Xfer_ && !Xfer_->Destroy())
+            LogMessage("Failed to destroy Sapera transfer object");
+        if (Conv_ && *Conv_ && !Conv_->Destroy())
+            LogMessage("Failed to destroy Sapera color conversion object");
         if (!Roi_->Destroy())
             LogMessage("Failed to destroy Sapera ROI object");
         delete Roi_;
         Roi_ = NULL;
-        if (!Xfer_->Destroy())
-            LogMessage("Failed to destroy Sapera transfer object");
-        if (Conv_ && !Conv_->Destroy())
-            LogMessage("Failed to destroy Sapera color conversion object");
         if (!Buffers_->Destroy())
             LogMessage("Failed to destroy Sapera buffer object");
     }
@@ -1312,6 +1397,9 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
     }
     if (isColor_ && Conv_ == NULL)
         Conv_ = new SapColorConversion(&AcqDevice_, Buffers_);
+    // Use whatever ROI coordinates are currently stored. Callers that change frame geometry
+    // (OnBinning, OnWidth, OnHeight) reset roiX_/roiY_/roiW_/roiH_ to 0,0,-1,-1 before
+    // calling here. SetROI()/ClearROI() set the desired values before calling here.
     Roi_ = new SapBufferRoi(Buffers_, roiX_, roiY_, roiW_, roiH_);
     if (isColor_)
     {
