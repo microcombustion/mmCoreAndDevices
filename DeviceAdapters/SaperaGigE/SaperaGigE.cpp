@@ -96,6 +96,9 @@ SaperaGigE::SaperaGigE() :
     initialized_(false),
     sequenceStarted_(false),
     imageCounter_(0),
+    intervalMs_(0.0),
+    numImages_(0),
+    stopRequested_(false),
     Buffers_(NULL),
     Roi_(NULL),
     AcqDeviceToBuf_(NULL),
@@ -122,6 +125,15 @@ SaperaGigE::~SaperaGigE()
 {
     if (initialized_)
         Shutdown();
+
+    // Defensive: a joinable std::thread destructor calls std::terminate. Shutdown() above
+    // already requests and joins the stop worker on every normal path, but guard here too
+    // in case this object is destroyed without going through Shutdown().
+    if (stopWorker_.joinable())
+    {
+        RequestStop();
+        stopWorker_.join();
+    }
 
     NumberOfWorkableCameras_ = 0;
 }
@@ -157,6 +169,7 @@ int SaperaGigE::GetListOfAvailableCameras()
     }
     else {
         // add available servers to property and set active device to first server in the list
+        activeDevice_ = acqDeviceList_[0];
         CPropertyAction* pAct = new CPropertyAction(this, &SaperaGigE::OnCamera);
         int nRet = CreateProperty(g_CameraServer, acqDeviceList_[0].c_str(), MM::String, false, pAct, true);
         assert(nRet == DEVICE_OK);
@@ -235,7 +248,10 @@ int SaperaGigE::Initialize()
     int ret;
 
     LogMessage((std::string)"Initialize device '" + activeDevice_ + "'");
-    SapLocation loc_(activeDevice_.c_str());
+    // Assign the member loc_ (declared in the header) -- do not shadow it with a local of the
+    // same name, or Shutdown()'s loc_.GetServerName() log below ends up reading a
+    // default-constructed SapLocation.
+    loc_ = SapLocation(activeDevice_.c_str());
     AcqDevice_ = SapAcqDevice(loc_, false);
     if (!AcqDevice_.Create())
     {
@@ -357,11 +373,20 @@ int SaperaGigE::Initialize()
 
         if (sapType == SapFeature::TypeEnum)
         {
+            // GetEnumCount()/GetEnumString() list every entry statically defined in the
+            // camera's GenICam XML, regardless of whether it is currently selectable given
+            // the camera's other current feature settings (a standard GenICam concept).
+            // IsEnumEnabled() is the SDK's per-entry availability check (the same one
+            // GigEFlatFieldDemo uses before offering a value) -- skip entries it reports as
+            // disabled, or SetFeatureValue() rejects them later with a GenApi AccessException.
             vector<string> allowed;
             int count;
             AcqFeature_.GetEnumCount(&count);
             for (int i = 0; i < count; i++)
             {
+                BOOL enabled;
+                if (!AcqFeature_.IsEnumEnabled(i, &enabled) || !enabled)
+                    continue;
                 AcqFeature_.GetEnumString(i, value, sizeof(value));
                 allowed.push_back(value);
             }
@@ -372,6 +397,11 @@ int SaperaGigE::Initialize()
 
     // binning
     ret = SetUpBinningProperties();
+    if (ret != DEVICE_OK)
+        return ret;
+
+    // frame rate cap (best-effort; never fails Initialize -- see SetUpFrameRateProperty)
+    ret = SetUpFrameRateProperty();
     if (ret != DEVICE_OK)
         return ret;
 
@@ -419,6 +449,12 @@ int SaperaGigE::Shutdown()
     LogMessage((std::string)"Shutting down device '" + loc_.GetServerName() + "'");
 
     initialized_ = false;
+
+    // Tear down any live sequence (and join its worker) before touching the SDK objects below.
+    RequestStop();
+    if (stopWorker_.joinable())
+        stopWorker_.join();
+
     Xfer_->Freeze();
     if (!Xfer_->Wait(5000))
         return DEVICE_NATIVE_MODULE_FAILED;
@@ -501,7 +537,12 @@ int SaperaGigE::SnapImage()
 const unsigned char* SaperaGigE::GetImageBuffer()
 {
     // For a color sensor, demosaic the just-acquired raw Bayer buffer into Conv_'s RGB
-    // output buffer before reading pixels out of it.
+    // output buffer before reading pixels out of it. The SDK demos instead drive Convert()
+    // asynchronously through a SapProcessing helper (Execute()/ProCallback) so a live-preview
+    // UI thread stays unblocked; this adapter has no live preview and both call sites
+    // (here and XferCallback) need the converted buffer ready immediately, so it calls
+    // Convert() synchronously instead. SapProcessing exposes no Wait() on a specific buffer
+    // index, so adopting it would mean adding new synchronization, not just swapping the call.
     SapBuffer* src = Buffers_;
     if (isColor_)
     {
@@ -676,33 +717,72 @@ int SaperaGigE::SetBinning(int binF)
 }
 
 /**
-* Stop a running sequence acquisition.
-* This is the single teardown path for streaming: it is the only place that flips
-* sequenceStarted_ to false, stops the hardware, and fires AcqFinished. It is called by
-* the client / acquisition engine (an early user stop, or after a finite acquisition has
-* drained its frames) -- MMCore has no internal thread that auto-stops the sequence.
-* Idempotent: a redundant second call (e.g. engine cleanup after the user already
-* stopped) is a no-op.
-* Required by the MM::Camera API.
+* Idempotent, non-blocking stop signal. Safe to call from the callback thread
+* (self-stop) or the MMCore thread (user stop): sets stopRequested_ and wakes the stop
+* worker, which performs the actual teardown off-thread. stopRequested_ is guarded
+* solely by stopMutex_ -- see the member declaration in the header for why.
 */
-int SaperaGigE::StopSequenceAcquisition()
+void SaperaGigE::RequestStop()
 {
-    // Flip the flag under the lock so exactly one caller runs the teardown below.
+    std::lock_guard<std::mutex> lock(stopMutex_);
+    stopRequested_ = true;
+    stopCv_.notify_one();
+}
+
+/**
+* Body of the stop worker thread started by StartSequenceAcquisition(): waits for
+* RequestStop() to signal, then runs the actual teardown. Checking the predicate while
+* holding stopMutex_ means a stop requested before this wait is reached is still observed
+* immediately (no lost wakeup). stopMutex_ is released before performTeardown_() runs, so
+* RequestStop() is never blocked behind the (potentially slow) teardown.
+*/
+void SaperaGigE::StopWorkerLoop_()
+{
+    std::unique_lock<std::mutex> lock(stopMutex_);
+    stopCv_.wait(lock, [this] { return stopRequested_.load(); });
+    lock.unlock();
+    performTeardown_();
+}
+
+/**
+* Single teardown path for streaming: the only place that flips sequenceStarted_ to
+* false, stops the hardware, and fires AcqFinished. Idempotent (a stop requested with no
+* sequence running is a no-op). Runs only on the stop worker thread -- never call this
+* from XferCallback (see that function's comment for why).
+*/
+void SaperaGigE::performTeardown_()
+{
     seqLock_.Lock();
     if (!sequenceStarted_)
     {
         seqLock_.Unlock();
-        return DEVICE_OK;
+        return;
     }
     sequenceStarted_ = false;
     seqLock_.Unlock();
 
     // Never hold seqLock_ while calling into the Sapera SDK or MMCore (they can block or
-    // re-enter). Request the stop, join the transfer, then signal acquisition finished.
+    // re-enter).
     Xfer_->Freeze();
     if (!Xfer_->Wait(5000))
         LogMessage("Timed out waiting for transfer to stop");
     GetCoreCallback()->AcqFinished(this, 0);
+}
+
+/**
+* Stop a running sequence acquisition.
+* Called by the client / acquisition engine (an early user stop -- a finite acquisition
+* that reaches its count, or an InsertImage() error, self-stops via RequestStop() from
+* XferCallback instead, see there). Requests the stop and joins the worker thread, so the
+* hardware is guaranteed stopped before this returns. No-op if no worker exists or the
+* sequence already finished.
+* Required by the MM::Camera API.
+*/
+int SaperaGigE::StopSequenceAcquisition()
+{
+    RequestStop();
+    if (stopWorker_.joinable() && std::this_thread::get_id() != stopWorker_.get_id())
+        stopWorker_.join();
     return DEVICE_OK;
 }
 
@@ -712,26 +792,44 @@ int SaperaGigE::StopSequenceAcquisition()
 */
 int SaperaGigE::StartSequenceAcquisition(double interval_ms)
 {
-    // The camera does not self-limit; the acquisition engine stops it once it has pulled
-    // the frames it wants. Forward to the counted overload with an effectively unbounded
-    // count and no overflow stop.
+    // Live view: an effectively unbounded frame count (no self-stop on count) and no
+    // overflow-stop override -- the actionable overflow rule is "stop on any InsertImage
+    // error" regardless (see XferCallback), so stopOnOverflow itself is not stored.
     return StartSequenceAcquisition((std::numeric_limits<long>::max)(), interval_ms, false);
 }
 
 /**
-* Start a sequence acquisition driven by the native Sapera transfer callback.
-* The camera free-runs; numImages/stopOnOverflow are accepted but not enforced
-* device-side -- a finite acquisition is stopped by the acquisition engine calling
-* StopSequenceAcquisition() after it has drained numImages frames from the circular
-* buffer (the proven Aravis client-stop pattern).
+* Start a sequence acquisition driven by the native Sapera transfer callback. The camera
+* free-runs; XferCallback paces frames to interval_ms, tags delivered frames with the
+* correct component count, and self-stops (via RequestStop(), on a dedicated worker
+* thread -- never inline in the callback) once numImages frames have been delivered or
+* InsertImage() reports an error.
 * Required by the MM::Camera API.
 */
 int SaperaGigE::StartSequenceAcquisition(long numImages, double interval_ms, bool stopOnOverflow)
 {
+    // stopOnOverflow is intentionally not stored: MMCore's InsertImage() contract is to
+    // stop on any error regardless of this flag (see XferCallback).
+    (void)stopOnOverflow;
+
+    if (numImages <= 0)
+        return DEVICE_INVALID_INPUT_PARAM;
+
     {
         MMThreadGuard g(seqLock_);
         if (sequenceStarted_)
             return DEVICE_CAMERA_BUSY_ACQUIRING;
+    }
+
+    // Join any prior (already finished, not-yet-joined) worker. Safe here: the check above
+    // guarantees no sequence is currently active, so a *live* worker cannot still be
+    // blocked on the stop condition variable -- joining one of those would hang forever.
+    if (stopWorker_.joinable())
+        stopWorker_.join();
+
+    {
+        std::lock_guard<std::mutex> lock(stopMutex_);
+        stopRequested_ = false;
     }
 
     // Start the transfer first (Aravis order); only arm the sequence on success.
@@ -752,15 +850,23 @@ int SaperaGigE::StartSequenceAcquisition(long numImages, double interval_ms, boo
         return ret;
     }
 
-    MMThreadGuard g(seqLock_);
-    imageCounter_ = 0;
-    sequenceStarted_ = true;
+    {
+        MMThreadGuard g(seqLock_);
+        imageCounter_ = 0;
+        intervalMs_ = interval_ms;
+        numImages_ = numImages;
+        nextFrameTime_ = GetCurrentMMTime(); // first frame is due immediately
+        sequenceStarted_ = true;
+    }
+
+    // Start the fresh worker outside seqLock_.
+    stopWorker_ = std::thread(&SaperaGigE::StopWorkerLoop_, this);
     return DEVICE_OK;
 }
 
 bool SaperaGigE::IsCapturing() {
-    // Reflects sequenceStarted_, which only goes false in StopSequenceAcquisition(), so
-    // this never reports "done" while the hardware is still transferring.
+    // Reflects sequenceStarted_, which only goes false in performTeardown_(), so this
+    // never reports "done" while the hardware is still transferring.
     MMThreadGuard g(seqLock_);
     return sequenceStarted_;
 }
@@ -1054,6 +1160,45 @@ int SaperaGigE::OnExposure(MM::PropertyBase* pProp, MM::ActionType eAct)
     return DEVICE_OK;
 }
 
+/**
+* Handles "AcquisitionFrameRate" property. Set up (fail-soft) by SetUpFrameRateProperty();
+* see there for why this is genuinely untested against real hardware.
+*/
+int SaperaGigE::OnAcquisitionFrameRate(MM::PropertyBase* pProp, MM::ActionType eAct)
+{
+    double rate;
+    if (eAct == MM::AfterSet)
+    {
+        pProp->Get(rate);
+
+        // Best-effort: a camera may require the rate control to be explicitly enabled
+        // before SetFeatureValue("AcquisitionFrameRate", ...) actually takes effect.
+        // Absence of either feature is fine -- the rate write below is attempted regardless.
+        BOOL hasEnable;
+        if (AcqDevice_.IsFeatureAvailable("AcquisitionFrameRateEnable", &hasEnable) && hasEnable)
+            AcqDevice_.SetFeatureValue("AcquisitionFrameRateEnable", true);
+        BOOL hasMode;
+        if (AcqDevice_.IsFeatureAvailable("AcquisitionFrameRateControlMode", &hasMode) && hasMode)
+            AcqDevice_.SetFeatureValue("AcquisitionFrameRateControlMode", "Programmable");
+
+        if (!AcqDevice_.SetFeatureValue("AcquisitionFrameRate", rate))
+        {
+            LogMessage("Failed to set feature value for 'AcquisitionFrameRate'");
+            return DEVICE_ERR;
+        }
+    }
+    else if (eAct == MM::BeforeGet)
+    {
+        if (!AcqDevice_.GetFeatureValue("AcquisitionFrameRate", &rate))
+        {
+            LogMessage("Failed to get feature value for 'AcquisitionFrameRate'");
+            return DEVICE_ERR;
+        }
+        pProp->Set(rate);
+    }
+    return DEVICE_OK;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Private SaperaGigE methods
 ///////////////////////////////////////////////////////////////////////////////
@@ -1116,8 +1261,20 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
     }
 
     // default value
-    if (pixelFormat.size())
-        AcqDevice_.SetFeatureValue("PixelFormat", pixelFormat.c_str());
+    //
+    // The camera can reject a value the enum lists as a possible entry but that isn't
+    // currently selectable given other feature settings (GenApi AccessException). Buffers_/
+    // Roi_/Xfer_/Conv_ were already torn down above, so do NOT return early here -- fall
+    // through to rebuild them against the camera's actual (unchanged) current PixelFormat,
+    // and only report the failure (after that rebuild leaves the device in a working state)
+    // via pixelFormatFailed below.
+    bool pixelFormatFailed = false;
+    if (pixelFormat.size() && !AcqDevice_.SetFeatureValue("PixelFormat", pixelFormat.c_str()))
+    {
+        LogMessage((std::string)"Failed to set feature value for 'PixelFormat' to '"
+            + pixelFormat + "'");
+        pixelFormatFailed = true;
+    }
     if (width > 0)
         AcqDevice_.SetFeatureValue("Width", width);
     if (height > 0)
@@ -1194,19 +1351,27 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
     }
     ResizeImageBuffer();
 
+    // Reported only now: buffers/transfer/conversion above were already rebuilt against the
+    // camera's actual (unchanged) PixelFormat, so the device is left in a working state
+    // either way -- this only tells the caller the requested value didn't take effect.
+    if (pixelFormatFailed)
+        return DEVICE_INVALID_PROPERTY_VALUE;
+
     return DEVICE_OK;
 }
 
 /*
  * Native Sapera transfer callback: invoked (serially, one completed buffer at a time)
- * when the transfer finishes a frame. This is the streaming path -- it reads the
- * just-completed buffer and pushes it into the MMCore circular buffer. It NEVER stops the
- * hardware, calls Wait(), or calls AcqFinished(); teardown is StopSequenceAcquisition()'s
- * sole responsibility.
+ * when the transfer finishes a frame. This is the streaming path -- it paces frames to
+ * intervalMs_, reads the just-completed buffer, tags it with the correct component count,
+ * and pushes it into the MMCore circular buffer. On a finite-length completion or an
+ * InsertImage() error it calls RequestStop() -- it NEVER calls Freeze()/Wait()/AcqFinished()
+ * itself; Sapera serializes transfer callbacks, so blocking on this same transfer's Wait()
+ * from in here risks deadlock. Actual teardown runs on the stop worker thread
+ * (performTeardown_()).
  *
- * Locking rule: seqLock_ protects state only. We read the flag under the lock, release
- * it, then make the SDK buffer read and the InsertImage call outside the lock, and
- * finally re-take the lock to bump imageCounter_.
+ * Locking rule: seqLock_ protects state only. We read/update state under the lock, release
+ * it, then make the SDK buffer read and the InsertImage call outside the lock.
  */
 void SaperaGigE::XferCallback(SapXferCallbackInfo* pInfo)
 {
@@ -1218,7 +1383,7 @@ void SaperaGigE::XferCallback(SapXferCallbackInfo* pInfo)
     bool started = self->sequenceStarted_;
     self->seqLock_.Unlock();
     if (!started)
-        return; // StopSequenceAcquisition() already flipped the flag: drop in-flight frames
+        return; // performTeardown_() already flipped the flag: drop in-flight frames
 
     // Buffer overflow: drop the frame and log it (no blocking MessageBox dialog).
     if (pInfo->IsTrash())
@@ -1228,8 +1393,21 @@ void SaperaGigE::XferCallback(SapXferCallbackInfo* pInfo)
         return;
     }
 
+    // Software frame-pacing gate: drop frames that arrive before the requested interval has
+    // elapsed. Advance nextFrameTime_ from "now" (not the previous deadline) to avoid
+    // catch-up bursts. Only a frame that is actually delivered below advances the deadline.
+    self->seqLock_.Lock();
+    if (self->intervalMs_ > 0.0 && self->GetCurrentMMTime() < self->nextFrameTime_)
+    {
+        self->seqLock_.Unlock();
+        return;
+    }
+    self->nextFrameTime_ = self->GetCurrentMMTime() + MM::MMTime::fromMs(self->intervalMs_);
+    self->seqLock_.Unlock();
+
     // For a color sensor, demosaic the just-completed raw Bayer buffer into Conv_'s RGB
-    // output buffer before reading pixels out of it.
+    // output buffer before reading pixels out of it (synchronously -- see the same note in
+    // GetImageBuffer() for why this differs from the SDK demos' SapProcessing-based approach).
     SapBuffer* src = self->Buffers_;
     if (self->isColor_)
     {
@@ -1243,13 +1421,24 @@ void SaperaGigE::XferCallback(SapXferCallbackInfo* pInfo)
         self->img_.Width(), self->img_.Height(),
         const_cast<unsigned char*>(self->img_.GetPixels()));
     int ret = self->GetCoreCallback()->InsertImage(self, self->img_.GetPixels(),
-        self->GetImageWidth(), self->GetImageHeight(), self->GetImageBytesPerPixel());
+        self->GetImageWidth(), self->GetImageHeight(), self->GetImageBytesPerPixel(),
+        self->GetNumberOfComponents());
     if (ret != DEVICE_OK)
-        self->LogMessage("InsertImage failed in transfer callback");
+    {
+        // Per the MM::Core contract, stop on any InsertImage() error (this is also how
+        // a circular-buffer overflow is reported). A frame that never reached MMCore must
+        // not count toward the finite total below.
+        self->LogMessage("InsertImage failed in transfer callback; stopping sequence");
+        self->RequestStop();
+        return;
+    }
 
     self->seqLock_.Lock();
     ++self->imageCounter_;
+    bool done = self->imageCounter_ >= self->numImages_;
     self->seqLock_.Unlock();
+    if (done)
+        self->RequestStop();
 }
 
 
@@ -1322,4 +1511,46 @@ int SaperaGigE::SetUpBinningProperties()
     }
 
     return SetAllowedValues(MM::g_Keyword_Binning, binValues);
+}
+
+/**
+* Sets up "AcquisitionFrameRate" as a real, writable property (per HOT_CAMERA.md) so a
+* capable camera can cap hardware readout. Self-contained and fail-soft, modeled on
+* SetUpBinningProperties(): unlike the generic deviceFeatures loop in Initialize() (which
+* would fail Initialize() on a GetFeatureValue error), every failure path here just logs and
+* returns DEVICE_OK, skipping the property -- absence of frame-rate control on a given
+* camera must never prevent the device from initializing.
+* "AcquisitionFrameRate"/"AcquisitionFrameRateEnable"/"AcquisitionFrameRateControlMode" are
+* standard GenICam SFNC names but are defined by each camera's own GenICam XML, not by the
+* Sapera SDK -- they could not be found anywhere in the local SDK install, so this is
+* genuinely untested against real hardware.
+*/
+int SaperaGigE::SetUpFrameRateProperty()
+{
+    BOOL isAvailable;
+    if (!AcqDevice_.IsFeatureAvailable("AcquisitionFrameRate", &isAvailable) || !isAvailable)
+    {
+        LogMessage("Feature 'AcquisitionFrameRate' is not supported");
+        return DEVICE_OK;
+    }
+
+    double rate;
+    if (!AcqDevice_.GetFeatureValue("AcquisitionFrameRate", &rate))
+    {
+        LogMessage("Failed to get feature value for 'AcquisitionFrameRate'; skipping property");
+        return DEVICE_OK;
+    }
+
+    CPropertyAction* pAct = new CPropertyAction(this, &SaperaGigE::OnAcquisitionFrameRate);
+    int ret = CreateProperty("AcquisitionFrameRate", CDeviceUtils::ConvertToString(rate),
+        MM::Float, false, pAct);
+    if (ret != DEVICE_OK)
+        return ret;
+
+    double low, high;
+    AcqDevice_.GetFeatureInfo("AcquisitionFrameRate", &AcqFeature_);
+    if (AcqFeature_.GetMin(&low) && AcqFeature_.GetMax(&high))
+        SetPropertyLimits("AcquisitionFrameRate", low, high);
+
+    return DEVICE_OK;
 }

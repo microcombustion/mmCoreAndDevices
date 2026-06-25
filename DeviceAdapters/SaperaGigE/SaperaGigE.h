@@ -33,10 +33,14 @@
 #include "SapClassBasic.h"
 #include "../MMDevice/ModuleInterface.h"
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <iterator>
 #include <map>
+#include <thread>
 
 //////////////////////////////////////////////////////////////////////////////
 // Error codes
@@ -122,6 +126,7 @@ public:
     int OnPixelType(MM::PropertyBase* pProp, MM::ActionType eAct);
     int OnGain(MM::PropertyBase* pProp, MM::ActionType eAct);
     int OnExposure(MM::PropertyBase* pProp, MM::ActionType eAct);
+    int OnAcquisitionFrameRate(MM::PropertyBase* pProp, MM::ActionType eAct);
     int OnCamera(MM::PropertyBase* pProp, MM::ActionType eAct);//for multiple camera support
     int OnCameraName(MM::PropertyBase* pProp, MM::ActionType eAct);
 
@@ -140,12 +145,30 @@ private:
     int bitsPerPixel_;
     bool initialized_;
     // Single load-bearing lifecycle flag: a transfer is live and not yet torn down. Its
-    // flip to false inside StopSequenceAcquisition() is the once-only guard for both the
+    // flip to false inside performTeardown_() is the once-only guard for both the
     // hardware stop and AcqFinished. Also what SnapImage() checks to reject snap during a
     // sequence. Read/written only under seqLock_.
     bool sequenceStarted_;
-    long imageCounter_;       // image-number metadata/diagnostics only; does not drive stopping
-    MMThreadLock seqLock_;    // guards sequenceStarted_ and imageCounter_ together
+    long imageCounter_;       // counts only *delivered* frames; drives the numImages_ self-stop
+    double intervalMs_;       // requested min frame spacing (<= 0: deliver every frame)
+    MM::MMTime nextFrameTime_; // earliest delivery time of the next frame
+    long numImages_;          // requested finite sequence length (LONG_MAX = unbounded/live)
+    MMThreadLock seqLock_;    // guards sequenceStarted_, imageCounter_, intervalMs_,
+                              // nextFrameTime_, and numImages_ together
+
+    // Self-stop (numImages_ reached, or an InsertImage() error) must not call
+    // Freeze()/Wait()/AcqFinished() from inside XferCallback -- Sapera serializes transfer
+    // callbacks, so blocking on the same transfer's Wait() there risks deadlock (see the
+    // callback's own comment). RequestStop() instead signals this worker thread, which runs
+    // performTeardown_() off the callback thread. stopRequested_ is guarded SOLELY by
+    // stopMutex_ -- never by seqLock_ -- so the worker's wait/notify can never miss a signal.
+    std::thread stopWorker_;
+    std::atomic<bool> stopRequested_;
+    std::mutex stopMutex_;
+    std::condition_variable stopCv_;
+    void RequestStop();
+    void StopWorkerLoop_();
+    void performTeardown_();
 
     int ResizeImageBuffer();
     void GenerateImage();
@@ -184,6 +207,7 @@ private:
 
     int FreeHandles();
     int SetUpBinningProperties();
+    int SetUpFrameRateProperty();
     int SynchronizeBuffers(std::string pixelFormat = "", int width = -1, int height = -1, double timeout = -1.);
     long CheckValue(const char*, long);
     static void XferCallback(SapXferCallbackInfo*);

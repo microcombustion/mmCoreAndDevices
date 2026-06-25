@@ -13,23 +13,17 @@ acquisition** via `Xfer_->Grab()` (`SaperaGigE.cpp:738`) -- the same call
 the sensor exposes/reads out and the GigE Vision link transmits continuously
 at the camera's native frame rate for as long as the sequence is running.
 
-Both overloads of `StartSequenceAcquisition` accept an `interval_ms`
-parameter, but it is **never read or applied anywhere in the function body**:
+**Fixed:** `interval_ms` is now applied as a software frame-pacing gate in
+`XferCallback` (`SaperaGigE.cpp:1349`) -- frames arriving before the requested
+interval has elapsed since the last *delivered* frame are dropped, rather than
+all being pushed into the circular buffer at the camera's native rate. This
+does not change the camera's free-run readout itself (the sensor/link still
+run continuously at native rate during the sequence -- see the Caveat below
+for why that's expected for this class of camera); it only changes how many
+of those frames MMCore actually receives. Genuine rate-limiting at the
+sensor/transmitter would need `TriggerMode`/`AcquisitionFrameRate` (see below).
 
-```cpp
-int SaperaGigE::StartSequenceAcquisition(double interval_ms)               // SaperaGigE.cpp:713
-int SaperaGigE::StartSequenceAcquisition(long numImages, double interval_ms, bool stopOnOverflow)  // SaperaGigE.cpp:729
-```
-
-No throttling, no `Sleep`, no GenICam frame-rate-limit feature is set. So
-regardless of whether the caller requested a fast burst or a sparse
-time-lapse (e.g. one frame every 30 s), the sensor and transmitter run
-flat-out for the full duration the sequence is armed; `XferCallback`
-(`SaperaGigE.cpp:1211`) just keeps pushing every captured frame into the
-circular buffer. Pacing/dropping is left entirely to whatever called
-`StartSequenceAcquisition`.
-
-`SnapImage()` (`SaperaGigE.cpp:466`) arms the transfer for exactly one frame
+`SnapImage()` (`SaperaGigE.cpp:493`) arms the transfer for exactly one frame
 via `Xfer_->Snap(1)`, waits for it, and then the *transfer* goes idle again.
 It was originally expected that this would avoid the heat. **In practice the
 camera is reported to run hot during single snaps as well.** That observation
@@ -41,48 +35,36 @@ powered continuously. `Snap` vs `Grab` only changes whether frames are
 exposed/read-out/transmitted, not whether that silicon is powered. So the
 camera being warm even when not actively transferring frames is expected.
 
-This also means actual frame timing during a "timed" sequence isn't what a
-user would expect: frames arrive back-to-back at the camera's native rate
-rather than spaced by `interval_ms` -- a correctness issue independent of the
-heat.
+## What's in the MM property interface
 
-## What's missing from the MM property interface
+`Initialize()`'s `deviceFeatures` map (`SaperaGigE.cpp:294-318`) exposes:
+`PixelFormat`, `ExposureTime`, `Gain`, various read-only identity/sensor
+fields, binning, ROI (`OffsetX/Y`, `Width/Height`), `ImageTimeout`, and
+`SensorTemperature`.
 
-`Initialize()`'s `deviceFeatures` map (`SaperaGigE.cpp:276-317`) currently
-exposes: `PixelFormat`, `ExposureTime`, `Gain`, various read-only
-identity/sensor fields, binning, ROI (`OffsetX/Y`, `Width/Height`),
-`ImageTimeout`, and `SensorTemperature`. Nothing is wired up for trigger mode
-or frame-rate limiting, so there is currently no way -- via this adapter --
-to keep the sensor idle between frames during a sequence, or to cap its
-free-run rate.
+**Fixed:** `AcquisitionFrameRate` (a standard GenICam SFNC feature, same
+naming convention as `"ExposureTime"`/`"Gain"`/`"PixelFormat"` above) is now
+exposed as a real, writable `MM::Float` property via
+`SetUpFrameRateProperty()`/`OnAcquisitionFrameRate()`, caps the free-run rate
+directly if the camera supports rate-limiting in continuous mode. It is
+self-contained and fail-soft -- absence on a given camera is logged and
+skipped, never fails `Initialize()`. **This could not be exercised against
+real hardware**: `AcquisitionFrameRate`/`AcquisitionFrameRateEnable`/
+`AcquisitionFrameRateControlMode` are camera-firmware-defined GenICam names,
+not Sapera SDK constants, and none of them could be found anywhere in the
+local SDK install. Confirm against a real camera (Teledyne's CamExpert, under
+"Acquisition Control", shows whether a given camera exposes these and what
+values they accept) before relying on it.
 
-## Suggested next steps (not yet implemented)
-
-GenICam's standard feature set (SFNC) -- the same naming convention every
-existing property here already uses (`"ExposureTime"`, `"Gain"`,
-`"PixelFormat"` are all SFNC names passed straight to
-`AcqDevice_.SetFeatureValue`/`GetFeatureValue`) -- defines the controls that
-would address this:
-
-- **`TriggerMode`** (`Off`/`On`) + **`TriggerSource`** -- switch the sensor
-  from continuous free-run to only exposing on a trigger (software or
-  external), so it is idle between frames instead of running continuously
-  during a sequence.
-- **`AcquisitionFrameRate`** -- caps the free-run rate directly, if the
-  camera supports rate-limiting in continuous mode.
-
-Whether the specific connected camera implements these is a per-device
-question. Teledyne's CamExpert (see `reference_sapera_sdk` notes) shows,
-under its "Acquisition Control" feature category, whether `TriggerMode` /
-`AcquisitionFrameRate` exist for a given camera and what values they accept
--- no code change needed to check.
-
-If they are supported, candidate properties could be added to the
-`deviceFeatures` map the same way every other feature already is. The
-existing pattern guards each entry with `IsFeatureAvailable()`
-(`SaperaGigE.cpp:326-333`) and silently skips it if unsupported, so adding
-candidates for `TriggerMode`/`TriggerSource`/`AcquisitionFrameRate` would be
-safe even if a given camera doesn't expose all three.
+**Not yet implemented:** `TriggerMode` (`Off`/`On`) + `TriggerSource` --
+switching the sensor from continuous free-run to only exposing on a trigger
+(software or external) would keep it idle between frames instead of running
+continuously during a sequence. Same caveat as above: whether a given camera
+supports this is a per-device question, checkable via CamExpert. If
+supported, it could be added as a `deviceFeatures` map entry the same way
+every other feature already is -- the existing pattern guards each entry
+with `IsFeatureAvailable()` (`SaperaGigE.cpp:343-350`) and silently skips it
+if unsupported.
 
 ## Caveat
 
@@ -93,9 +75,12 @@ while acquiring. Because heat is observed during single `SnapImage()` calls
 and not only during sequence acquisition, this baseline dissipation is the
 most likely dominant cause, and it **cannot be addressed from this adapter**.
 
-The free-running behavior described above remains real and is still worth
-fixing for the *frame-timing correctness* reason (a "timed" sequence does not
-actually honor `interval_ms`), and `TriggerMode`/`AcquisitionFrameRate` would
-shave the *incremental* heat from continuous readout during long sequences.
-But none of that will make a continuously connected camera run cool: that is
-expected behavior for this class of camera, not a software bug.
+The free-running behavior described above remains real: the sensor/link
+still run continuously at native rate during a sequence even with the
+`interval_ms` delivery-pacing fix above (it only changes what reaches MMCore,
+not the camera's own readout). `TriggerMode`/`AcquisitionFrameRate` are what
+would shave the *incremental* heat from continuous readout during long
+sequences -- `AcquisitionFrameRate` is now wired up (untested against
+hardware, see above); `TriggerMode` is not yet implemented. But none of that
+will make a continuously connected camera run cool: that is expected
+behavior for this class of camera, not a software bug.
