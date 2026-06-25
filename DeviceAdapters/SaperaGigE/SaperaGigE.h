@@ -31,7 +31,6 @@
 #include "conio.h"
 #include "math.h"
 #include "SapClassBasic.h"
-#include "../MMDevice/ModuleInterface.h"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -47,9 +46,6 @@
 //
 #define ERR_UNKNOWN_MODE         102
 
-const char* g_CameraDeviceName = "Sapera GigE camera adapter";
-const char* g_CameraServer = "AcquisitionDevice";
-
 std::wstring s2ws(const std::string&);
 int ErrorBox(std::string text, std::string caption);
 
@@ -59,12 +55,12 @@ private:
 
     struct feature
     {
-        char* name;
+        const char* name;
         bool readOnly;
         CPropertyAction* action;
     };
 
-    feature define_feature(char* name, bool readOnly, CPropertyAction* action) {
+    feature define_feature(const char* name, bool readOnly, CPropertyAction* action) {
         feature out = { name, readOnly, action };
         return out;
     }

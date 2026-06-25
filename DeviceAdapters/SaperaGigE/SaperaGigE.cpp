@@ -23,7 +23,12 @@
 
 #include "SaperaGigE.h"
 
+#include "ModuleInterface.h"
+
 using namespace std;
+
+const char* g_CameraDeviceName = "Sapera GigE camera adapter";
+const char* g_CameraServer = "AcquisitionDevice";
 
 ///////////////////////////////////////////////////////////////////////////////
 // Exported MMDevice API
@@ -49,9 +54,8 @@ MODULE_API MM::Device* CreateDevice(const char* deviceName)
         return new SaperaGigE();
     }
 
-    // ...supplied name not recognized
-    // to heck with it, return a device anyway
-    return new SaperaGigE();
+    // Supplied name not recognized.
+    return 0;
 }
 
 MODULE_API void DeleteDevice(MM::Device* pDevice)
@@ -211,9 +215,6 @@ int SaperaGigE::OnCamera(MM::PropertyBase* pProp, MM::ActionType eAct)
 
         }
         assert(!"Unrecognized Camera");
-    }
-    else if (eAct == MM::BeforeGet) {
-        // Empty path
     }
     return DEVICE_OK;
 }
@@ -542,7 +543,7 @@ int SaperaGigE::SnapImage()
 * The calling program will assume the size of the buffer based on the values
 * obtained from GetImageBufferSize(), which in turn should be consistent with
 * values returned by GetImageWidth(), GetImageHeight() and GetImageBytesPerPixel().
-* The calling program allso assumes that camera never changes the size of
+* The calling program also assumes that camera never changes the size of
 * the pixel buffer on its own. In other words, the buffer can change only if
 * appropriate properties are set (such as binning, pixel type, etc.)
 */
@@ -1246,8 +1247,8 @@ int SaperaGigE::OnExposure(MM::PropertyBase* pProp, MM::ActionType eAct)
 }
 
 /**
-* Handles "AcquisitionFrameRate" property. Set up (fail-soft) by SetUpFrameRateProperty();
-* see there for why this is genuinely untested against real hardware.
+* Handles "AcquisitionFrameRate" property. Set up as a fail-soft optional GenICam/SFNC
+* feature by SetUpFrameRateProperty().
 */
 int SaperaGigE::OnAcquisitionFrameRate(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
