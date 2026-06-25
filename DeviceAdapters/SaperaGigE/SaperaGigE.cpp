@@ -299,37 +299,37 @@ int SaperaGigE::Initialize()
         new CPropertyAction(this, &SaperaGigE::OnExposure));
     deviceFeatures[MM::g_Keyword_Gain] = define_feature("Gain", false,
         new CPropertyAction(this, &SaperaGigE::OnGain));
-    deviceFeatures["CameraVendor"] = define_feature("DeviceVendorName", true, NULL);
-    deviceFeatures["CameraFamily"] = define_feature("DeviceFamilyName", true, NULL);
+    deviceFeatures["DeviceVendorName"] = define_feature("DeviceVendorName", true, NULL);
+    deviceFeatures["DeviceFamilyName"] = define_feature("DeviceFamilyName", true, NULL);
     deviceFeatures[MM::g_Keyword_CameraName] = define_feature("DeviceModelName", true, NULL);
-    deviceFeatures["CameraVersion"] = define_feature("DeviceVersion", true, NULL);
-    deviceFeatures["CameraInfo"] = define_feature("DeviceManufacturerInfo", true, NULL);
-    deviceFeatures["CameraPartNumber"] = define_feature("deviceManufacturerPartNumber", true, NULL);
-    deviceFeatures["CameraFirmwareVersion"] = define_feature("DeviceFirmwareVersion", true, NULL);
-    deviceFeatures["CameraSerialNumber"] = define_feature("DeviceSerialNumber", true, NULL);
+    deviceFeatures["DeviceVersion"] = define_feature("DeviceVersion", true, NULL);
+    deviceFeatures["DeviceManufacturerInfo"] = define_feature("DeviceManufacturerInfo", true, NULL);
+    deviceFeatures["deviceManufacturerPartNumber"] = define_feature("deviceManufacturerPartNumber", true, NULL);
+    deviceFeatures["DeviceFirmwareVersion"] = define_feature("DeviceFirmwareVersion", true, NULL);
+    deviceFeatures["DeviceSerialNumber"] = define_feature("DeviceSerialNumber", true, NULL);
     deviceFeatures[MM::g_Keyword_CameraID] = define_feature("DeviceUserID", true, NULL);
-    deviceFeatures["CameraMacAddress"] = define_feature("deviceMacAddress", true, NULL);
-    deviceFeatures["SensorColorType"] = define_feature("sensorColorType", true, NULL);
-    deviceFeatures["SensorPixelCoding"] = define_feature("PixelCoding", true, NULL);
-    deviceFeatures["SensorBlackLevelSelector"] = define_feature("BlackLevelSelector", false,
+    deviceFeatures["deviceMacAddress"] = define_feature("deviceMacAddress", true, NULL);
+    deviceFeatures["sensorColorType"] = define_feature("sensorColorType", true, NULL);
+    deviceFeatures["PixelCoding"] = define_feature("PixelCoding", true, NULL);
+    deviceFeatures["BlackLevelSelector"] = define_feature("BlackLevelSelector", false,
         new CPropertyAction(this, &SaperaGigE::OnBlackLevelSelector));
-    deviceFeatures["SensorBlackLevel"] = define_feature("BlackLevel", false,
+    deviceFeatures["BlackLevel"] = define_feature("BlackLevel", false,
         new CPropertyAction(this, &SaperaGigE::OnBlackLevel));
-    deviceFeatures["SensorPixelInput"] = define_feature("pixelSizeInput", true, NULL);
+    deviceFeatures["pixelSizeInput"] = define_feature("pixelSizeInput", true, NULL);
     deviceFeatures["SensorShutterMode"] = define_feature("SensorShutterMode", true, NULL);
-    deviceFeatures["SensorBinningMode"] = define_feature("binningMode", false,
+    deviceFeatures["binningMode"] = define_feature("binningMode", false,
         new CPropertyAction(this, &SaperaGigE::OnBinningMode));
     deviceFeatures["SensorWidth"] = define_feature("SensorWidth", true, NULL);
     deviceFeatures["SensorHeight"] = define_feature("SensorHeight", true, NULL);
-    deviceFeatures["ImagePixelSize"] = define_feature("PixelSize", true,
+    deviceFeatures["PixelSize"] = define_feature("PixelSize", true,
         new CPropertyAction(this, &SaperaGigE::OnPixelSize));
-    deviceFeatures["ImageHorizontalOffset"] = define_feature("OffsetX", false,
+    deviceFeatures["OffsetX"] = define_feature("OffsetX", false,
         new CPropertyAction(this, &SaperaGigE::OnOffsetX));
-    deviceFeatures["ImageVerticalOffset"] = define_feature("OffsetY", false,
+    deviceFeatures["OffsetY"] = define_feature("OffsetY", false,
         new CPropertyAction(this, &SaperaGigE::OnOffsetY));
-    deviceFeatures["ImageWidth"] = define_feature("Width", false,
+    deviceFeatures["Width"] = define_feature("Width", false,
         new CPropertyAction(this, &SaperaGigE::OnWidth));
-    deviceFeatures["ImageHeight"] = define_feature("Height", false,
+    deviceFeatures["Height"] = define_feature("Height", false,
         new CPropertyAction(this, &SaperaGigE::OnHeight));
     deviceFeatures["ImageTimeout"] = define_feature("ImageTimeout", false,
         new CPropertyAction(this, &SaperaGigE::OnImageTimeout));
@@ -344,32 +344,17 @@ int SaperaGigE::Initialize()
     for (x = deviceFeatures.begin(); x != deviceFeatures.end(); x++)
     {
         feature f = x->second;
-        bool isDeviceTemperature = std::string(x->first) == "DeviceTemperature";
         BOOL isAvailable;
         AcqDevice_.IsFeatureAvailable(f.name, &isAvailable);
         if (!isAvailable)
         {
             LogMessage((std::string)"Feature '" + f.name
                 + "' is not supported");
-            if (isDeviceTemperature)
-            {
-                ret = CreateProperty(x->first, "0", MM::Float, true, f.action);
-                assert(ret == DEVICE_OK);
-            }
             continue;
         }
 
         LogMessage((std::string)"Adding feature '" + f.name
             + "' as property '" + x->first + "'");
-        char value[MM::MaxStrLength];
-        if (!AcqDevice_.GetFeatureValue(f.name, value, sizeof(value)))
-        {
-            if (!isDeviceTemperature)
-                return DEVICE_ERR;
-            LogMessage("Failed to read initial value for 'DeviceTemperature'; using cached default");
-            snprintf(value, sizeof(value), "0");
-        }
-
         AcqDevice_.GetFeatureInfo(f.name, &AcqFeature_);
         SapFeature::Type sapType;
         AcqFeature_.GetType(&sapType);
@@ -380,6 +365,14 @@ int SaperaGigE::Initialize()
             eType = MM::String;
         else
             eType = it->second;
+
+        char value[MM::MaxStrLength];
+        if (!AcqDevice_.GetFeatureValue(f.name, value, sizeof(value)))
+        {
+            LogMessage((std::string)"Failed to read initial value for '" + f.name
+                + "'; using cached default");
+            snprintf(value, sizeof(value), "%s", eType == MM::String ? "" : "0");
+        }
 
         if (f.action == NULL)
             ret = CreateProperty(x->first, value, eType, f.readOnly);
@@ -493,9 +486,17 @@ int SaperaGigE::FreeHandles()
 {
     std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     LogMessage((std::string)"Destroy Sapera buffers and devices");
+    int ret = DestroySaperaPipeline_();
+    if (!AcqFeature_.Destroy()) ret = DEVICE_ERR;
+    if (!AcqDevice_.Destroy()) ret = DEVICE_ERR;
+    return ret;
+}
+
+int SaperaGigE::DestroySaperaPipeline_()
+{
     // Accumulate errors but attempt every destroy: an early return on first failure leaves
     // later kernel objects live, which is exactly the state cormem.sys cannot safely clean
-    // up after a process exit (→ 0x1a/0x1230 BSOD on the next init).
+    // up after a process exit (0x1a/0x1230 BSOD on the next init).
     int ret = DEVICE_OK;
     if (Xfer_ && *Xfer_ && !Xfer_->Destroy()) ret = DEVICE_ERR;
     if (Conv_ && *Conv_ && !Conv_->Destroy()) ret = DEVICE_ERR;
@@ -504,11 +505,6 @@ int SaperaGigE::FreeHandles()
     // destroying Roi_ while Xfer_ is still live causes cormem.sys to BSOD (0x1230).
     if (Roi_ && *Roi_ && !Roi_->Destroy()) ret = DEVICE_ERR;
     if (Buffers_ && !Buffers_->Destroy()) ret = DEVICE_ERR;
-    if (!AcqFeature_.Destroy()) ret = DEVICE_ERR;
-    if (!AcqDevice_.Destroy()) ret = DEVICE_ERR;
-    // Full teardown (paired with the AcqDevice_/AcqFeature_ destroy above): a later
-    // Initialize() rebuilds these from scratch via SynchronizeBuffers(), so it is safe to
-    // delete the persistent objects here.
     delete AcqDeviceToBuf_;
     AcqDeviceToBuf_ = NULL;
     Xfer_ = NULL;
@@ -676,6 +672,8 @@ int SaperaGigE::SetROI(unsigned x, unsigned y, unsigned xSize, unsigned ySize)
     // ROI would make SapBufferRoi::Create() fail mid-rebuild, leaving the adapter in a broken
     // state (Xfer_/Roi_ null, initialized_ true). Also catches xSize==0 or ySize==0 alone.
     UINT32 fullWidth = 0, fullHeight = 0;
+    if (!IsFeatureAvailable("Width") || !IsFeatureAvailable("Height"))
+        return DEVICE_INVALID_PROPERTY;
     if (!AcqDevice_.GetFeatureValue("Width", &fullWidth) ||
         !AcqDevice_.GetFeatureValue("Height", &fullHeight))
         return DEVICE_ERR;
@@ -953,6 +951,18 @@ bool SaperaGigE::IsCapturing() {
     return sequenceStarted_ || transferActive_;
 }
 
+bool SaperaGigE::IsFeatureAvailable(const char* featureName)
+{
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
+    BOOL isAvailable = FALSE;
+    if (!AcqDevice_.IsFeatureAvailable(featureName, &isAvailable) || !isAvailable)
+    {
+        LogMessage((std::string)"Feature '" + featureName + "' is not supported or currently unavailable");
+        return false;
+    }
+    return true;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // SaperaGigE Action handlers
 ///////////////////////////////////////////////////////////////////////////////
@@ -968,6 +978,8 @@ int SaperaGigE::OnBinning(MM::PropertyBase* pProp, MM::ActionType eAct)
         // Reconfiguration reallocates buffers; reject while streaming (see img_ invariant).
         if (IsCapturing())
             return DEVICE_CAMERA_BUSY_ACQUIRING;
+        if (!IsFeatureAvailable("BinningVertical") || !IsFeatureAvailable("BinningHorizontal"))
+            return DEVICE_INVALID_PROPERTY;
         long binSize;
         pProp->Get(binSize);
         if (!AcqDevice_.SetFeatureValue("BinningVertical", int(binSize)))
@@ -986,6 +998,8 @@ int SaperaGigE::OnBinningMode(MM::PropertyBase* pProp, MM::ActionType eAct)
     std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     if (eAct == MM::AfterSet)
     {
+        if (!IsFeatureAvailable("binningMode"))
+            return DEVICE_INVALID_PROPERTY;
         std::string value;
         pProp->Get(value);
         AcqDevice_.SetFeatureValue("binningMode", value.c_str());
@@ -1003,6 +1017,8 @@ int SaperaGigE::OnPixelSize(MM::PropertyBase* pProp, MM::ActionType eAct)
     }
     else if (eAct == MM::BeforeGet)
     {
+        if (!IsFeatureAvailable("PixelSize"))
+            return DEVICE_OK;
         UINT32 value;
         if (!AcqDevice_.GetFeatureValue("PixelSize", &value))
             return DEVICE_ERR;
@@ -1014,6 +1030,8 @@ int SaperaGigE::OnPixelSize(MM::PropertyBase* pProp, MM::ActionType eAct)
 long SaperaGigE::CheckValue(const char* key, long value)
 {
     std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
+    if (!IsFeatureAvailable(key))
+        return value;
     INT64 minVal, maxVal, inc;
     AcqDevice_.GetFeatureInfo(key, &AcqFeature_);
     AcqFeature_.GetInc(&inc);
@@ -1037,12 +1055,16 @@ int SaperaGigE::OnOffsetX(MM::PropertyBase* pProp, MM::ActionType eAct)
         long value;
         pProp->Get(value);
 
+        if (!IsFeatureAvailable("OffsetX"))
+            return DEVICE_INVALID_PROPERTY;
         value = CheckValue("OffsetX", value);
         if (!AcqDevice_.SetFeatureValue("OffsetX", value))
             return DEVICE_ERR;
     }
     else if (eAct == MM::BeforeGet)
     {
+        if (!IsFeatureAvailable("OffsetX"))
+            return DEVICE_OK;
         UINT32 value;
         if (!AcqDevice_.GetFeatureValue("OffsetX", &value))
             return DEVICE_ERR;
@@ -1059,12 +1081,16 @@ int SaperaGigE::OnOffsetY(MM::PropertyBase* pProp, MM::ActionType eAct)
         long value;
         pProp->Get(value);
 
+        if (!IsFeatureAvailable("OffsetY"))
+            return DEVICE_INVALID_PROPERTY;
         value = CheckValue("OffsetY", value);
         if (!AcqDevice_.SetFeatureValue("OffsetY", value))
             return DEVICE_ERR;
     }
     else if (eAct == MM::BeforeGet)
     {
+        if (!IsFeatureAvailable("OffsetY"))
+            return DEVICE_OK;
         UINT32 value;
         if (!AcqDevice_.GetFeatureValue("OffsetY", &value))
             return DEVICE_ERR;
@@ -1081,6 +1107,8 @@ int SaperaGigE::OnWidth(MM::PropertyBase* pProp, MM::ActionType eAct)
         // Reconfiguration reallocates buffers; reject while streaming (see img_ invariant).
         if (IsCapturing())
             return DEVICE_CAMERA_BUSY_ACQUIRING;
+        if (!IsFeatureAvailable("Width"))
+            return DEVICE_INVALID_PROPERTY;
         long value;
         pProp->Get(value);
 
@@ -1092,6 +1120,8 @@ int SaperaGigE::OnWidth(MM::PropertyBase* pProp, MM::ActionType eAct)
     }
     else if (eAct == MM::BeforeGet)
     {
+        if (!IsFeatureAvailable("Width"))
+            return DEVICE_OK;
         UINT32 value;
         if (!AcqDevice_.GetFeatureValue("Width", &value))
             return DEVICE_ERR;
@@ -1108,6 +1138,8 @@ int SaperaGigE::OnHeight(MM::PropertyBase* pProp, MM::ActionType eAct)
         // Reconfiguration reallocates buffers; reject while streaming (see img_ invariant).
         if (IsCapturing())
             return DEVICE_CAMERA_BUSY_ACQUIRING;
+        if (!IsFeatureAvailable("Height"))
+            return DEVICE_INVALID_PROPERTY;
         long value;
         pProp->Get(value);
 
@@ -1119,6 +1151,8 @@ int SaperaGigE::OnHeight(MM::PropertyBase* pProp, MM::ActionType eAct)
     }
     else if (eAct == MM::BeforeGet)
     {
+        if (!IsFeatureAvailable("Height"))
+            return DEVICE_OK;
         UINT32 value;
         if (!AcqDevice_.GetFeatureValue("Height", &value))
             return DEVICE_ERR;
@@ -1135,6 +1169,8 @@ int SaperaGigE::OnImageTimeout(MM::PropertyBase* pProp, MM::ActionType eAct)
         // Reconfiguration reallocates buffers; reject while streaming (see img_ invariant).
         if (IsCapturing())
             return DEVICE_CAMERA_BUSY_ACQUIRING;
+        if (!IsFeatureAvailable("ImageTimeout"))
+            return DEVICE_INVALID_PROPERTY;
         double value;
         pProp->Get(value);
         int ret = SynchronizeBuffers("", -1, -1, value);
@@ -1143,6 +1179,8 @@ int SaperaGigE::OnImageTimeout(MM::PropertyBase* pProp, MM::ActionType eAct)
     }
     else if (eAct == MM::BeforeGet)
     {
+        if (!IsFeatureAvailable("ImageTimeout"))
+            return DEVICE_OK;
         double value;
         if (!AcqDevice_.GetFeatureValue("ImageTimeout", &value))
             return DEVICE_ERR;
@@ -1160,6 +1198,8 @@ int SaperaGigE::OnTemperature(MM::PropertyBase* pProp, MM::ActionType eAct)
     else if (eAct == MM::BeforeGet)
     {
         if (IsCapturing())
+            return DEVICE_OK;
+        if (!IsFeatureAvailable("DeviceTemperature"))
             return DEVICE_OK;
         std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
         double value;
@@ -1180,7 +1220,10 @@ int SaperaGigE::OnPixelType(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
     std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     char pixelFormat[10];
-    AcqDevice_.GetFeatureValue("PixelFormat", pixelFormat, sizeof(pixelFormat));
+    if (!IsFeatureAvailable("PixelFormat"))
+        return DEVICE_INVALID_PROPERTY;
+    if (!AcqDevice_.GetFeatureValue("PixelFormat", pixelFormat, sizeof(pixelFormat)))
+        return DEVICE_ERR;
     if (eAct == MM::AfterSet)
     {
         // Reconfiguration reallocates buffers; reject while streaming (see img_ invariant).
@@ -1214,6 +1257,8 @@ int SaperaGigE::OnGain(MM::PropertyBase* pProp, MM::ActionType eAct)
     double gain = 1.;
     if (eAct == MM::AfterSet)
     {
+        if (!IsFeatureAvailable("Gain"))
+            return DEVICE_INVALID_PROPERTY;
         pProp->Get(gain);
         if (!AcqDevice_.SetFeatureValue("Gain", gain))
         {
@@ -1223,6 +1268,8 @@ int SaperaGigE::OnGain(MM::PropertyBase* pProp, MM::ActionType eAct)
     }
     else if (eAct == MM::BeforeGet)
     {
+        if (!IsFeatureAvailable("Gain"))
+            return DEVICE_OK;
         if (!AcqDevice_.GetFeatureValue("Gain", &gain))
         {
             LogMessage("Failed to get feature value for 'Gain'");
@@ -1241,6 +1288,8 @@ int SaperaGigE::OnBlackLevelSelector(MM::PropertyBase* pProp, MM::ActionType eAc
     {
         if (IsCapturing())
             return DEVICE_CAMERA_BUSY_ACQUIRING;
+        if (!IsFeatureAvailable("BlackLevelSelector"))
+            return DEVICE_INVALID_PROPERTY;
         std::string value;
         pProp->Get(value);
         if (!AcqDevice_.SetFeatureValue("BlackLevelSelector", value.c_str()))
@@ -1251,6 +1300,8 @@ int SaperaGigE::OnBlackLevelSelector(MM::PropertyBase* pProp, MM::ActionType eAc
     }
     else if (eAct == MM::BeforeGet)
     {
+        if (!IsFeatureAvailable("BlackLevelSelector"))
+            return DEVICE_OK;
         char value[MM::MaxStrLength];
         if (!AcqDevice_.GetFeatureValue("BlackLevelSelector", value, sizeof(value)))
         {
@@ -1268,6 +1319,8 @@ int SaperaGigE::OnBlackLevel(MM::PropertyBase* pProp, MM::ActionType eAct)
     double level;
     if (eAct == MM::AfterSet)
     {
+        if (!IsFeatureAvailable("BlackLevel"))
+            return DEVICE_INVALID_PROPERTY;
         pProp->Get(level);
         if (!AcqDevice_.SetFeatureValue("BlackLevel", level))
         {
@@ -1277,6 +1330,8 @@ int SaperaGigE::OnBlackLevel(MM::PropertyBase* pProp, MM::ActionType eAct)
     }
     else if (eAct == MM::BeforeGet)
     {
+        if (!IsFeatureAvailable("BlackLevel"))
+            return DEVICE_OK;
         if (!AcqDevice_.GetFeatureValue("BlackLevel", &level))
         {
             LogMessage("Failed to get feature value for 'BlackLevel'");
@@ -1294,6 +1349,8 @@ int SaperaGigE::OnExposure(MM::PropertyBase* pProp, MM::ActionType eAct)
     double exposure;
     if (eAct == MM::AfterSet)
     {
+        if (!IsFeatureAvailable("ExposureTime"))
+            return DEVICE_INVALID_PROPERTY;
         pProp->Get(exposure);  // ms
         if (!AcqDevice_.SetFeatureValue("ExposureTime", exposure * 1000.0)) // ms to us
         {
@@ -1303,6 +1360,8 @@ int SaperaGigE::OnExposure(MM::PropertyBase* pProp, MM::ActionType eAct)
     }
     else if (eAct == MM::BeforeGet)
     {
+        if (!IsFeatureAvailable("ExposureTime"))
+            return DEVICE_OK;
         if (!AcqDevice_.GetFeatureValue("ExposureTime", &exposure)) // us
         {
             LogMessage("Failed to get feature value for 'ExposureTime'");
@@ -1323,6 +1382,8 @@ int SaperaGigE::OnAcquisitionFrameRate(MM::PropertyBase* pProp, MM::ActionType e
     double rate;
     if (eAct == MM::AfterSet)
     {
+        if (!IsFeatureAvailable("AcquisitionFrameRate"))
+            return DEVICE_INVALID_PROPERTY;
         pProp->Get(rate);
 
         // Best-effort: a camera may require the rate control to be explicitly enabled
@@ -1343,6 +1404,8 @@ int SaperaGigE::OnAcquisitionFrameRate(MM::PropertyBase* pProp, MM::ActionType e
     }
     else if (eAct == MM::BeforeGet)
     {
+        if (!IsFeatureAvailable("AcquisitionFrameRate"))
+            return DEVICE_OK;
         if (!AcqDevice_.GetFeatureValue("AcquisitionFrameRate", &rate))
         {
             LogMessage("Failed to get feature value for 'AcquisitionFrameRate'");
@@ -1364,6 +1427,8 @@ int SaperaGigE::ResizeImageBuffer()
 {
     std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     UINT32 width, height;
+    if (!IsFeatureAvailable("Height") || !IsFeatureAvailable("Width"))
+        return DEVICE_INVALID_PROPERTY;
     if (!AcqDevice_.GetFeatureValue("Height", &height))
         return DEVICE_INVALID_PROPERTY;
     if (!AcqDevice_.GetFeatureValue("Width", &width))
@@ -1398,53 +1463,63 @@ void SaperaGigE::GenerateImage()
 int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int height, double timeout)
 {
     std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
-    // destroy transfer and buffer
+
+    if (pixelFormat.size() && !IsFeatureAvailable("PixelFormat"))
+        return DEVICE_INVALID_PROPERTY;
+    if (width > 0 && !IsFeatureAvailable("Width"))
+        return DEVICE_INVALID_PROPERTY;
+    if (height > 0 && !IsFeatureAvailable("Height"))
+        return DEVICE_INVALID_PROPERTY;
+    if (timeout > 0 && !IsFeatureAvailable("ImageTimeout"))
+        return DEVICE_INVALID_PROPERTY;
+    if (!IsFeatureAvailable("PixelSize"))
+        return DEVICE_INVALID_PROPERTY;
+
     // Callers only reach here with the transfer idle: OnPixelType/OnWidth/OnHeight etc.
     // reject via IsCapturing() while a sequence is running, and SnapImage() already blocks
-    // on Wait() before returning. So no Freeze()/Wait() is needed (or safe to assume armed)
-    // before tearing down here.
-    if (Roi_ != NULL)
+    // on Wait() before returning. Freeze()/Wait() is still used as a conservative Sapera
+    // driver barrier before cormem.sys is asked to unmap the old buffers.
+    if (Xfer_ && *Xfer_)
     {
-        // SDK teardown order matches MultiBoardSyncGrabDemo's DestroyObjects(): Xfer first,
-        // then ROI child, then parent buffer -- exact reverse of Create() order.
-        // SapBufferRoi has its own m_hTrashChild CORBUFFER; the Xfer holds references to
-        // all child buffer handles, so Roi_->Destroy() must not run while Xfer_ is live.
-        // Freeze()+Wait() ensures DMA is idle before touching the chain; mirrors Shutdown().
         Xfer_->Freeze();
-        Xfer_->Wait(5000);
-        if (Xfer_ && *Xfer_ && !Xfer_->Destroy())
-            LogMessage("Failed to destroy Sapera transfer object");
-        if (Conv_ && *Conv_ && !Conv_->Destroy())
-            LogMessage("Failed to destroy Sapera color conversion object");
-        if (!Roi_->Destroy())
-            LogMessage("Failed to destroy Sapera ROI object");
-        delete Roi_;
-        Roi_ = NULL;
-        if (!Buffers_->Destroy())
-            LogMessage("Failed to destroy Sapera buffer object");
+        if (!Xfer_->Wait(5000))
+            LogMessage("Timed out waiting for transfer to stop during buffer reconfiguration");
     }
+    int destroyRet = DestroySaperaPipeline_();
 
     // default value
     //
     // The camera can reject a value the enum lists as a possible entry but that isn't
-    // currently selectable given other feature settings (GenApi AccessException). Buffers_/
-    // Roi_/Xfer_/Conv_ were already torn down above, so do NOT return early here -- fall
+    // currently selectable given other feature settings (GenApi AccessException). The old
+    // Sapera pipeline was already torn down above, so do NOT return early here -- fall
     // through to rebuild them against the camera's actual (unchanged) current PixelFormat,
     // and only report the failure (after that rebuild leaves the device in a working state)
     // via pixelFormatFailed below.
     bool pixelFormatFailed = false;
-    if (pixelFormat.size() && !AcqDevice_.SetFeatureValue("PixelFormat", pixelFormat.c_str()))
+    if (pixelFormat.size())
     {
-        LogMessage((std::string)"Failed to set feature value for 'PixelFormat' to '"
-            + pixelFormat + "'");
-        pixelFormatFailed = true;
+        if (!AcqDevice_.SetFeatureValue("PixelFormat", pixelFormat.c_str()))
+        {
+            LogMessage((std::string)"Failed to set feature value for 'PixelFormat' to '"
+                + pixelFormat + "'");
+            pixelFormatFailed = true;
+        }
     }
     if (width > 0)
-        AcqDevice_.SetFeatureValue("Width", width);
+    {
+        if (!AcqDevice_.SetFeatureValue("Width", width))
+            LogMessage("Failed to set feature value for 'Width'");
+    }
     if (height > 0)
-        AcqDevice_.SetFeatureValue("Height", height);
+    {
+        if (!AcqDevice_.SetFeatureValue("Height", height))
+            LogMessage("Failed to set feature value for 'Height'");
+    }
     if (timeout > 0)
-        AcqDevice_.SetFeatureValue("ImageTimeout", timeout);
+    {
+        if (!AcqDevice_.SetFeatureValue("ImageTimeout", timeout))
+            LogMessage("Failed to set feature value for 'ImageTimeout'");
+    }
 
     // synchronize bit depth with camera
     AcqDevice_.GetFeatureValue("PixelSize", &bitsPerPixel_);
@@ -1452,18 +1527,10 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
     if (isColor_)
         bytesPerPixel_ = 4; // Conv_ always normalizes to 32-bit BGRA (SapFormatRGB8888)
 
-    // Construct the buffer/transfer/conversion objects exactly once (count and source
-    // device never change between calls); every later reconfiguration only
-    // Destroy()s/Create()s them in place. Never reassign these from a freshly-constructed
-    // temporary -- see the warning on the Buffers_/AcqDeviceToBuf_/Conv_ declarations in
-    // the header.
-    if (Buffers_ == NULL)
-    {
-        Buffers_ = new SapBufferWithTrash(3, &AcqDevice_);
-        AcqDeviceToBuf_ = new SapAcqDeviceToBuf(&AcqDevice_, Buffers_, XferCallback, this);
-        Xfer_ = AcqDeviceToBuf_;
-    }
-    if (isColor_ && Conv_ == NULL)
+    Buffers_ = new SapBufferWithTrash(3, &AcqDevice_);
+    AcqDeviceToBuf_ = new SapAcqDeviceToBuf(&AcqDevice_, Buffers_, XferCallback, this);
+    Xfer_ = AcqDeviceToBuf_;
+    if (isColor_)
         Conv_ = new SapColorConversion(&AcqDevice_, Buffers_);
     // Use whatever ROI coordinates are currently stored. Callers that change frame geometry
     // (OnBinning, OnWidth, OnHeight) reset roiX_/roiY_/roiW_/roiH_ to 0,0,-1,-1 before
@@ -1485,21 +1552,21 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
     }
     if (!Buffers_->Create())
     {
-        int ret = FreeHandles();
+        int ret = DestroySaperaPipeline_();
         if (ret != DEVICE_OK)
             return ret;
         return DEVICE_NATIVE_MODULE_FAILED;
     }
     if (!Roi_->Create())
     {
-        int ret = FreeHandles();
+        int ret = DestroySaperaPipeline_();
         if (ret != DEVICE_OK)
             return ret;
         return DEVICE_NATIVE_MODULE_FAILED;
     }
     if (isColor_ && !Conv_->Create())
     {
-        int ret = FreeHandles();
+        int ret = DestroySaperaPipeline_();
         if (ret != DEVICE_OK)
             return ret;
         return DEVICE_NATIVE_MODULE_FAILED;
@@ -1511,16 +1578,20 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
     }
     if (Xfer_ && !Xfer_->Create())
     {
-        int ret = FreeHandles();
+        int ret = DestroySaperaPipeline_();
         if (ret != DEVICE_OK)
             return ret;
         return DEVICE_NATIVE_MODULE_FAILED;
     }
-    ResizeImageBuffer();
+    int resizeRet = ResizeImageBuffer();
+    if (resizeRet != DEVICE_OK)
+        return resizeRet;
 
     // Reported only now: buffers/transfer/conversion above were already rebuilt against the
     // camera's actual (unchanged) PixelFormat, so the device is left in a working state
     // either way -- this only tells the caller the requested value didn't take effect.
+    if (destroyRet != DEVICE_OK)
+        return destroyRet;
     if (pixelFormatFailed)
         return DEVICE_INVALID_PROPERTY_VALUE;
 
@@ -1623,8 +1694,8 @@ int SaperaGigE::SetUpBinningProperties()
     std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     BOOL hasHorzBinning;
     BOOL hasVertBinning;
-    AcqDevice_.IsFeatureAvailable("BinningHorizontal", &hasHorzBinning);
-    AcqDevice_.IsFeatureAvailable("BinningVertical", &hasVertBinning);
+    hasHorzBinning = IsFeatureAvailable("BinningHorizontal");
+    hasVertBinning = IsFeatureAvailable("BinningVertical");
     if (!hasHorzBinning || !hasVertBinning)
     {
         if (!hasHorzBinning)
@@ -1699,8 +1770,7 @@ int SaperaGigE::SetUpBinningProperties()
 int SaperaGigE::SetUpFrameRateProperty()
 {
     std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
-    BOOL isAvailable;
-    if (!AcqDevice_.IsFeatureAvailable("AcquisitionFrameRate", &isAvailable) || !isAvailable)
+    if (!IsFeatureAvailable("AcquisitionFrameRate"))
     {
         LogMessage("Feature 'AcquisitionFrameRate' is not supported");
         return DEVICE_OK;

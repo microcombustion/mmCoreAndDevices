@@ -181,9 +181,9 @@ private:
     int GetListOfAvailableCameras();
     SapAcqDevice AcqDevice_;
     SapAcqDevice CurrentDevice_;
-    // Buffers_/AcqDeviceToBuf_ are constructed exactly once (in SynchronizeBuffers(), on
-    // first call) and torn down via Destroy()/Create() in place from then on. Never
-    // reassign them from a freshly-constructed temporary: SapAcqDeviceToBuf's constructor
+    // Buffers_/AcqDeviceToBuf_/Xfer_ are owned as a unit and rebuilt together whenever
+    // SynchronizeBuffers() changes a feature that affects Sapera buffer layout. Never
+    // reassign SapAcqDeviceToBuf from a freshly-constructed temporary: its constructor
     // registers a transfer pair that stores a pointer back to the constructed instance
     // (see AddPair() in the Sapera++ SDK), so assigning from a temporary leaves that
     // pointer dangling the moment the temporary is destroyed at the end of the statement.
@@ -201,16 +201,17 @@ private:
     SapTransfer* Xfer_;
     // Set once in Initialize() from AcqDevice_.IsRawBayerOutput() (the same call Sapera's
     // own CamExpert/demo apps use to detect a color sensor). When true, SynchronizeBuffers()
-    // constructs Conv_ with the same construct-once/Destroy()-Create()-in-place discipline
-    // as Buffers_/AcqDeviceToBuf_ above -- same dangling-pointer hazard applies.
+    // owns Conv_ as part of the same rebuildable Sapera pipeline as Buffers_/Xfer_.
     bool isColor_;
     SapColorConversion* Conv_;
     SapLocation loc_;
     SapFeature AcqFeature_;
 
     int FreeHandles();
+    int DestroySaperaPipeline_();
     int SetUpBinningProperties();
     int SetUpFrameRateProperty();
+    bool IsFeatureAvailable(const char* featureName);
     int SynchronizeBuffers(std::string pixelFormat = "", int width = -1, int height = -1, double timeout = -1.);
     long CheckValue(const char*, long);
     static void XferCallback(SapXferCallbackInfo*);
