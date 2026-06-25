@@ -147,12 +147,14 @@ private:
     // hardware stop and AcqFinished. Also what SnapImage() checks to reject snap during a
     // sequence. Read/written only under seqLock_.
     bool sequenceStarted_;
+    bool transferActive_;
     long imageCounter_;       // counts only *delivered* frames; drives the numImages_ self-stop
     double intervalMs_;       // requested min frame spacing (<= 0: deliver every frame)
     MM::MMTime nextFrameTime_; // earliest delivery time of the next frame
     long numImages_;          // requested finite sequence length (LONG_MAX = unbounded/live)
     MMThreadLock seqLock_;    // guards sequenceStarted_, imageCounter_, intervalMs_,
-                              // nextFrameTime_, and numImages_ together
+                              // nextFrameTime_, numImages_, and transferActive_ together
+    mutable std::recursive_mutex saperaMutex_; // serializes calls into Sapera SDK objects
 
     // Self-stop (numImages_ reached, or an InsertImage() error) must not call
     // Freeze()/Wait()/AcqFinished() from inside XferCallback -- Sapera serializes transfer

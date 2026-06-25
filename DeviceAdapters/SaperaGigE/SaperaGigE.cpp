@@ -95,6 +95,7 @@ SaperaGigE::SaperaGigE() :
     bitsPerPixel_(8),
     initialized_(false),
     sequenceStarted_(false),
+    transferActive_(false),
     imageCounter_(0),
     intervalMs_(0.0),
     numImages_(0),
@@ -333,7 +334,7 @@ int SaperaGigE::Initialize()
     deviceFeatures["ImageTimeout"] = define_feature("ImageTimeout", false,
         new CPropertyAction(this, &SaperaGigE::OnImageTimeout));
     deviceFeatures["TurboTransferEnable"] = define_feature("turboTransferEnable", true, NULL);
-    deviceFeatures["SensorTemperature"] = define_feature("DeviceTemperature", true,
+    deviceFeatures["DeviceTemperature"] = define_feature("DeviceTemperature", true,
         new CPropertyAction(this, &SaperaGigE::OnTemperature));
 
 
@@ -343,12 +344,18 @@ int SaperaGigE::Initialize()
     for (x = deviceFeatures.begin(); x != deviceFeatures.end(); x++)
     {
         feature f = x->second;
+        bool isDeviceTemperature = std::string(x->first) == "DeviceTemperature";
         BOOL isAvailable;
         AcqDevice_.IsFeatureAvailable(f.name, &isAvailable);
         if (!isAvailable)
         {
             LogMessage((std::string)"Feature '" + f.name
                 + "' is not supported");
+            if (isDeviceTemperature)
+            {
+                ret = CreateProperty(x->first, "0", MM::Float, true, f.action);
+                assert(ret == DEVICE_OK);
+            }
             continue;
         }
 
@@ -356,7 +363,12 @@ int SaperaGigE::Initialize()
             + "' as property '" + x->first + "'");
         char value[MM::MaxStrLength];
         if (!AcqDevice_.GetFeatureValue(f.name, value, sizeof(value)))
-            return DEVICE_ERR;
+        {
+            if (!isDeviceTemperature)
+                return DEVICE_ERR;
+            LogMessage("Failed to read initial value for 'DeviceTemperature'; using cached default");
+            snprintf(value, sizeof(value), "0");
+        }
 
         AcqDevice_.GetFeatureInfo(f.name, &AcqFeature_);
         SapFeature::Type sapType;
@@ -461,6 +473,7 @@ int SaperaGigE::Shutdown()
 
     // Guard: after a failed SynchronizeBuffers() rebuild, Xfer_ may be NULL even with
     // initialized_ true. FreeHandles() is still safe to call (it null-checks everything).
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     if (Xfer_)
     {
         Xfer_->Freeze();
@@ -478,6 +491,7 @@ int SaperaGigE::Shutdown()
 */
 int SaperaGigE::FreeHandles()
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     LogMessage((std::string)"Destroy Sapera buffers and devices");
     // Accumulate errors but attempt every destroy: an early return on first failure leaves
     // later kernel objects live, which is exactly the state cormem.sys cannot safely clean
@@ -517,22 +531,29 @@ int SaperaGigE::SnapImage()
     // Reject snap while a callback-driven sequence is live; snap and grab share img_.
     {
         MMThreadGuard g(seqLock_);
-        if (sequenceStarted_)
+        if (sequenceStarted_ || transferActive_)
             return DEVICE_CAMERA_BUSY_ACQUIRING;
+        transferActive_ = true;
     }
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
+    int ret = DEVICE_OK;
     // Start image capture
     Xfer_->SetCommandTimeout(1000);
     if (!Xfer_->Snap(1))
     {
         LogMessage("Failure occurred while capturing a single image");
-        return DEVICE_ERR;
+        ret = DEVICE_ERR;
     }
-    // Wait for either the capture to finish or 16 seconds, whichever is first
-    if (!Xfer_->Wait(16000))
+    else if (!Xfer_->Wait(16000))
     {
-        return DEVICE_ERR;
+        // Wait for either the capture to finish or 16 seconds, whichever is first.
+        ret = DEVICE_ERR;
     }
-    return DEVICE_OK;
+    {
+        MMThreadGuard g(seqLock_);
+        transferActive_ = false;
+    }
+    return ret;
 }
 
 
@@ -549,6 +570,7 @@ int SaperaGigE::SnapImage()
 */
 const unsigned char* SaperaGigE::GetImageBuffer()
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     // For a color sensor, demosaic the just-acquired raw Bayer buffer into Conv_'s RGB
     // output buffer before reading pixels out of it. The SDK demos instead drive Convert()
     // asynchronously through a SapProcessing helper (Execute()/ProCallback) so a live-preview
@@ -643,6 +665,7 @@ long SaperaGigE::GetImageBufferSize() const
 */
 int SaperaGigE::SetROI(unsigned x, unsigned y, unsigned xSize, unsigned ySize)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     // img_ geometry must stay stable while the callback is streaming into it.
     if (IsCapturing())
         return DEVICE_CAMERA_BUSY_ACQUIRING;
@@ -674,6 +697,7 @@ int SaperaGigE::SetROI(unsigned x, unsigned y, unsigned xSize, unsigned ySize)
 */
 int SaperaGigE::GetROI(unsigned& x, unsigned& y, unsigned& xSize, unsigned& ySize)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     // Roi_ can be null if SynchronizeBuffers() failed mid-rebuild; fall back to stored coords.
     if (!Roi_)
     {
@@ -696,6 +720,7 @@ int SaperaGigE::GetROI(unsigned& x, unsigned& y, unsigned& xSize, unsigned& ySiz
 */
 int SaperaGigE::ClearROI()
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     // img_ geometry must stay stable while the callback is streaming into it.
     if (IsCapturing())
         return DEVICE_CAMERA_BUSY_ACQUIRING;
@@ -785,20 +810,29 @@ void SaperaGigE::StopWorkerLoop_()
 void SaperaGigE::performTeardown_()
 {
     seqLock_.Lock();
-    if (!sequenceStarted_)
+    if (!sequenceStarted_ && !transferActive_)
     {
         seqLock_.Unlock();
         return;
     }
-    sequenceStarted_ = false;
+    bool notifyCore = sequenceStarted_;
     seqLock_.Unlock();
 
     // Never hold seqLock_ while calling into the Sapera SDK or MMCore (they can block or
     // re-enter).
-    Xfer_->Freeze();
-    if (!Xfer_->Wait(5000))
-        LogMessage("Timed out waiting for transfer to stop");
-    GetCoreCallback()->AcqFinished(this, 0);
+    {
+        std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
+        Xfer_->Freeze();
+        if (!Xfer_->Wait(5000))
+            LogMessage("Timed out waiting for transfer to stop");
+    }
+    {
+        MMThreadGuard g(seqLock_);
+        sequenceStarted_ = false;
+        transferActive_ = false;
+    }
+    if (notifyCore)
+        GetCoreCallback()->AcqFinished(this, 0);
 }
 
 /**
@@ -849,7 +883,7 @@ int SaperaGigE::StartSequenceAcquisition(long numImages, double interval_ms, boo
 
     {
         MMThreadGuard g(seqLock_);
-        if (sequenceStarted_)
+        if (sequenceStarted_ || transferActive_)
             return DEVICE_CAMERA_BUSY_ACQUIRING;
     }
 
@@ -865,10 +899,19 @@ int SaperaGigE::StartSequenceAcquisition(long numImages, double interval_ms, boo
     }
 
     // Start the Sapera transfer first; only arm the Micro-Manager sequence on success.
-    if (!Xfer_->Grab())
     {
-        LogMessage("Failed to start continuous acquisition");
-        return DEVICE_ERR;
+        MMThreadGuard g(seqLock_);
+        transferActive_ = true;
+    }
+    {
+        std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
+        if (!Xfer_->Grab())
+        {
+            MMThreadGuard g(seqLock_);
+            transferActive_ = false;
+            LogMessage("Failed to start continuous acquisition");
+            return DEVICE_ERR;
+        }
     }
 
     int ret = GetCoreCallback()->PrepareForAcq(this);
@@ -877,8 +920,15 @@ int SaperaGigE::StartSequenceAcquisition(long numImages, double interval_ms, boo
         // PrepareForAcq failed after the transfer started: undo the start. The sequence
         // never armed, so there is nothing to AcqFinish (AcqFinished pairs only with a
         // successful PrepareForAcq).
-        Xfer_->Freeze();
-        Xfer_->Wait(5000);
+        {
+            std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
+            Xfer_->Freeze();
+            Xfer_->Wait(5000);
+        }
+        {
+            MMThreadGuard g(seqLock_);
+            transferActive_ = false;
+        }
         return ret;
     }
 
@@ -897,10 +947,10 @@ int SaperaGigE::StartSequenceAcquisition(long numImages, double interval_ms, boo
 }
 
 bool SaperaGigE::IsCapturing() {
-    // Reflects sequenceStarted_, which only goes false in performTeardown_(), so this
-    // never reports "done" while the hardware is still transferring.
+    // Reflects both sequence acquisition and synchronous SnapImage()/teardown transfer
+    // windows, so callers do not touch Sapera buffers while the driver is active.
     MMThreadGuard g(seqLock_);
-    return sequenceStarted_;
+    return sequenceStarted_ || transferActive_;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -912,6 +962,7 @@ bool SaperaGigE::IsCapturing() {
 */
 int SaperaGigE::OnBinning(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     if (eAct == MM::AfterSet)
     {
         // Reconfiguration reallocates buffers; reject while streaming (see img_ invariant).
@@ -932,6 +983,7 @@ int SaperaGigE::OnBinning(MM::PropertyBase* pProp, MM::ActionType eAct)
 
 int SaperaGigE::OnBinningMode(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     if (eAct == MM::AfterSet)
     {
         std::string value;
@@ -944,6 +996,7 @@ int SaperaGigE::OnBinningMode(MM::PropertyBase* pProp, MM::ActionType eAct)
 
 int SaperaGigE::OnPixelSize(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     if (eAct == MM::AfterSet)
     {
         return DEVICE_CAN_NOT_SET_PROPERTY;
@@ -960,6 +1013,7 @@ int SaperaGigE::OnPixelSize(MM::PropertyBase* pProp, MM::ActionType eAct)
 
 long SaperaGigE::CheckValue(const char* key, long value)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     INT64 minVal, maxVal, inc;
     AcqDevice_.GetFeatureInfo(key, &AcqFeature_);
     AcqFeature_.GetInc(&inc);
@@ -977,6 +1031,7 @@ long SaperaGigE::CheckValue(const char* key, long value)
 
 int SaperaGigE::OnOffsetX(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     if (eAct == MM::AfterSet)
     {
         long value;
@@ -998,6 +1053,7 @@ int SaperaGigE::OnOffsetX(MM::PropertyBase* pProp, MM::ActionType eAct)
 
 int SaperaGigE::OnOffsetY(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     if (eAct == MM::AfterSet)
     {
         long value;
@@ -1019,6 +1075,7 @@ int SaperaGigE::OnOffsetY(MM::PropertyBase* pProp, MM::ActionType eAct)
 
 int SaperaGigE::OnWidth(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     if (eAct == MM::AfterSet)
     {
         // Reconfiguration reallocates buffers; reject while streaming (see img_ invariant).
@@ -1045,6 +1102,7 @@ int SaperaGigE::OnWidth(MM::PropertyBase* pProp, MM::ActionType eAct)
 
 int SaperaGigE::OnHeight(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     if (eAct == MM::AfterSet)
     {
         // Reconfiguration reallocates buffers; reject while streaming (see img_ invariant).
@@ -1071,6 +1129,7 @@ int SaperaGigE::OnHeight(MM::PropertyBase* pProp, MM::ActionType eAct)
 
 int SaperaGigE::OnImageTimeout(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     if (eAct == MM::AfterSet)
     {
         // Reconfiguration reallocates buffers; reject while streaming (see img_ invariant).
@@ -1100,11 +1159,14 @@ int SaperaGigE::OnTemperature(MM::PropertyBase* pProp, MM::ActionType eAct)
     }
     else if (eAct == MM::BeforeGet)
     {
+        if (IsCapturing())
+            return DEVICE_OK;
+        std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
         double value;
         if (!AcqDevice_.GetFeatureValue("DeviceTemperature", &value))
         {
-            LogMessage("Failed to get feature value for 'DeviceTemperature'");
-            return DEVICE_ERR;
+            LogMessage("Failed to get feature value for 'DeviceTemperature'; keeping cached property value");
+            return DEVICE_OK;
         }
         pProp->Set(value);
     }
@@ -1116,6 +1178,7 @@ int SaperaGigE::OnTemperature(MM::PropertyBase* pProp, MM::ActionType eAct)
 */
 int SaperaGigE::OnPixelType(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     char pixelFormat[10];
     AcqDevice_.GetFeatureValue("PixelFormat", pixelFormat, sizeof(pixelFormat));
     if (eAct == MM::AfterSet)
@@ -1147,6 +1210,7 @@ int SaperaGigE::OnPixelType(MM::PropertyBase* pProp, MM::ActionType eAct)
 */
 int SaperaGigE::OnGain(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     double gain = 1.;
     if (eAct == MM::AfterSet)
     {
@@ -1172,6 +1236,7 @@ int SaperaGigE::OnGain(MM::PropertyBase* pProp, MM::ActionType eAct)
 
 int SaperaGigE::OnBlackLevelSelector(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     if (eAct == MM::AfterSet)
     {
         if (IsCapturing())
@@ -1199,6 +1264,7 @@ int SaperaGigE::OnBlackLevelSelector(MM::PropertyBase* pProp, MM::ActionType eAc
 
 int SaperaGigE::OnBlackLevel(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     double level;
     if (eAct == MM::AfterSet)
     {
@@ -1223,6 +1289,7 @@ int SaperaGigE::OnBlackLevel(MM::PropertyBase* pProp, MM::ActionType eAct)
 
 int SaperaGigE::OnExposure(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     // note that GigE units of exposure are us; umanager uses ms
     double exposure;
     if (eAct == MM::AfterSet)
@@ -1252,6 +1319,7 @@ int SaperaGigE::OnExposure(MM::PropertyBase* pProp, MM::ActionType eAct)
 */
 int SaperaGigE::OnAcquisitionFrameRate(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     double rate;
     if (eAct == MM::AfterSet)
     {
@@ -1294,6 +1362,7 @@ int SaperaGigE::OnAcquisitionFrameRate(MM::PropertyBase* pProp, MM::ActionType e
 */
 int SaperaGigE::ResizeImageBuffer()
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     UINT32 width, height;
     if (!AcqDevice_.GetFeatureValue("Height", &height))
         return DEVICE_INVALID_PROPERTY;
@@ -1328,6 +1397,7 @@ void SaperaGigE::GenerateImage()
  */
 int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int height, double timeout)
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     // destroy transfer and buffer
     // Callers only reach here with the transfer idle: OnPixelType/OnWidth/OnHeight etc.
     // reject via IsCapturing() while a sequence is running, and SnapImage() already blocks
@@ -1482,6 +1552,14 @@ void SaperaGigE::XferCallback(SapXferCallbackInfo* pInfo)
     if (!started)
         return; // performTeardown_() already flipped the flag: drop in-flight frames
 
+    std::unique_lock<std::recursive_mutex> saperaGuard(self->saperaMutex_, std::try_to_lock);
+    if (!saperaGuard.owns_lock())
+    {
+        self->LogMessage("Sapera transfer callback could not acquire SDK lock; stopping sequence");
+        self->RequestStop();
+        return;
+    }
+
     // Buffer overflow: drop the frame and log it (no blocking MessageBox dialog).
     if (pInfo->IsTrash())
     {
@@ -1517,6 +1595,7 @@ void SaperaGigE::XferCallback(SapXferCallbackInfo* pInfo)
     src->ReadRect(self->Roi_->GetXMin(), self->Roi_->GetYMin(),
         self->img_.Width(), self->img_.Height(),
         const_cast<unsigned char*>(self->img_.GetPixels()));
+    saperaGuard.unlock();
     int ret = self->GetCoreCallback()->InsertImage(self, self->img_.GetPixels(),
         self->GetImageWidth(), self->GetImageHeight(), self->GetImageBytesPerPixel(),
         self->GetNumberOfComponents());
@@ -1541,6 +1620,7 @@ void SaperaGigE::XferCallback(SapXferCallbackInfo* pInfo)
 
 int SaperaGigE::SetUpBinningProperties()
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     BOOL hasHorzBinning;
     BOOL hasVertBinning;
     AcqDevice_.IsFeatureAvailable("BinningHorizontal", &hasHorzBinning);
@@ -1618,6 +1698,7 @@ int SaperaGigE::SetUpBinningProperties()
 */
 int SaperaGigE::SetUpFrameRateProperty()
 {
+    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     BOOL isAvailable;
     if (!AcqDevice_.IsFeatureAvailable("AcquisitionFrameRate", &isAvailable) || !isAvailable)
     {
