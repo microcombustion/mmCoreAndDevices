@@ -101,6 +101,10 @@ SaperaGigE::SaperaGigE() :
     stopRequested_(false),
     Buffers_(NULL),
     Roi_(NULL),
+    roiX_(0),
+    roiY_(0),
+    roiW_(-1),
+    roiH_(-1),
     AcqDeviceToBuf_(NULL),
     Xfer_(NULL),
     isColor_(false),
@@ -635,12 +639,14 @@ int SaperaGigE::SetROI(unsigned x, unsigned y, unsigned xSize, unsigned ySize)
     LogMessage((std::string)"Setting Region of Interest");
     if (xSize == 0 && ySize == 0)
         return ClearROI();
-    else
-    {
-        // apply ROI
-        Roi_->SetRoi(x, y, xSize, ySize);
-        img_.Resize(xSize, ySize);
-    }
+    // SapBufferRoi::SetRoi() is a pre-Create()-only call (SDK rejects it after Create()).
+    // Store coordinates and rebuild Roi_ with the new geometry.
+    roiX_ = (int)x; roiY_ = (int)y; roiW_ = (int)xSize; roiH_ = (int)ySize;
+    if (Roi_) { Roi_->Destroy(); delete Roi_; }
+    Roi_ = new SapBufferRoi(Buffers_, roiX_, roiY_, roiW_, roiH_);
+    if (!Roi_->Create())
+        return DEVICE_NATIVE_MODULE_FAILED;
+    img_.Resize(xSize, ySize);
     return DEVICE_OK;
 }
 
@@ -667,7 +673,12 @@ int SaperaGigE::ClearROI()
     // img_ geometry must stay stable while the callback is streaming into it.
     if (IsCapturing())
         return DEVICE_CAMERA_BUSY_ACQUIRING;
-    Roi_->ResetRoi();
+    // SapBufferRoi::ResetRoi() is pre-Create()-only. Rebuild Roi_ at full-frame geometry.
+    roiX_ = 0; roiY_ = 0; roiW_ = -1; roiH_ = -1;
+    if (Roi_) { Roi_->Destroy(); delete Roi_; }
+    Roi_ = new SapBufferRoi(Buffers_, 0, 0, -1, -1);
+    if (!Roi_->Create())
+        return DEVICE_NATIVE_MODULE_FAILED;
     ResizeImageBuffer();
     return DEVICE_OK;
 }
@@ -1301,7 +1312,7 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
     }
     if (isColor_ && Conv_ == NULL)
         Conv_ = new SapColorConversion(&AcqDevice_, Buffers_);
-    Roi_ = new SapBufferRoi(Buffers_);
+    Roi_ = new SapBufferRoi(Buffers_, roiX_, roiY_, roiW_, roiH_);
     if (isColor_)
     {
         // Per the SDK's own GigEBayerDemo: Enable() may need to modify the acquisition's

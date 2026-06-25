@@ -188,12 +188,15 @@ private:
     // (see AddPair() in the Sapera++ SDK), so assigning from a temporary leaves that
     // pointer dangling the moment the temporary is destroyed at the end of the statement.
     SapBufferWithTrash* Buffers_;
-    // Roi_ is a child of Buffers_ (its parent), rebuilt every SynchronizeBuffers() call --
-    // unlike Buffers_/AcqDeviceToBuf_ it is NOT construct-once. Still must go through the
-    // same Create()/Destroy() discipline (Create() after Buffers_->Create(), Destroy()
-    // before Buffers_->Destroy()/delete) every single SDK demo uses for SapBufferRoi.
-    // Skipping this left it dangling against an already-destroyed Buffers_ on Shutdown().
+    // Roi_ is a child of Buffers_ (its parent), rebuilt every SynchronizeBuffers() call and
+    // on every SetROI()/ClearROI() call -- unlike Buffers_/AcqDeviceToBuf_ it is NOT
+    // construct-once. Must go through the same Create()/Destroy() discipline as the SDK's own
+    // SapBufferRoi demos. SapBufferRoi::SetRoi()/ResetRoi() are pre-Create() only (the SDK
+    // rejects them after Create() with "Cannot be called after the Create Method"); ROI
+    // geometry is therefore stored in roiX_/roiY_/roiW_/roiH_ and passed to the constructor
+    // every time a new Roi_ is allocated (-1 for roiW_/roiH_ means "full parent extent").
     SapBufferRoi* Roi_;
+    int roiX_, roiY_, roiW_, roiH_;
     SapAcqDeviceToBuf* AcqDeviceToBuf_;
     SapTransfer* Xfer_;
     // Set once in Initialize() from AcqDevice_.IsRawBayerOutput() (the same call Sapera's
