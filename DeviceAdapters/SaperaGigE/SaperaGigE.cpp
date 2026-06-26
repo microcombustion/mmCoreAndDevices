@@ -512,7 +512,7 @@ int SaperaGigE::DestroySaperaPipeline_()
     // Xfer_ holds references to all child buffer handles including Roi_'s m_hTrashChild;
     // destroying Roi_ while Xfer_ is still live causes cormem.sys to BSOD (0x1230).
     if (Roi_ && *Roi_ && !Roi_->Destroy()) ret = DEVICE_ERR;
-    if (Buffers_ && !Buffers_->Destroy()) ret = DEVICE_ERR;
+    if (Buffers_ && *Buffers_ && !Buffers_->Destroy()) ret = DEVICE_ERR;
 
     // Do not delete these Sapera++ wrappers on final shutdown. Their Destroy() methods
     // have released the driver/kernel handles above; running the wrapper destructors during
@@ -1656,8 +1656,7 @@ void SaperaGigE::XferCallback(SapXferCallbackInfo* pInfo)
     std::unique_lock<std::recursive_mutex> saperaGuard(self->saperaMutex_, std::try_to_lock);
     if (!saperaGuard.owns_lock())
     {
-        self->LogMessage("Sapera transfer callback could not acquire SDK lock; stopping sequence");
-        self->RequestStop();
+        self->LogMessage("Sapera transfer callback could not acquire SDK lock; dropping frame");
         return;
     }
 
