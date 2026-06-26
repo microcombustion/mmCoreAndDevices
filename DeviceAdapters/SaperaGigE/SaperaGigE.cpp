@@ -270,6 +270,14 @@ int SaperaGigE::Initialize()
             return ret;
         return DEVICE_NATIVE_MODULE_FAILED;
     }
+    const auto failInitialize = [this](int error) {
+        // Initialization can fail after Sapera handles or DMA buffers were created, before
+        // initialized_ is set. Clean up Sapera kernel handles here; FreeHandles()
+        // intentionally abandons Sapera++ wrapper allocations after Destroy() to avoid
+        // cormem.sys crashes in their destructors.
+        int cleanup = FreeHandles();
+        return cleanup != DEVICE_OK ? cleanup : error;
+    };
 
     NumberOfWorkableCameras_++;
 
@@ -407,18 +415,18 @@ int SaperaGigE::Initialize()
     // binning
     ret = SetUpBinningProperties();
     if (ret != DEVICE_OK)
-        return ret;
+        return failInitialize(ret);
 
     // frame rate cap (best-effort; never fails Initialize -- see SetUpFrameRateProperty)
     ret = SetUpFrameRateProperty();
     if (ret != DEVICE_OK)
-        return ret;
+        return failInitialize(ret);
 
     // set up Sapera / Micro-Manager buffers
     LogMessage((std::string) "Setting up buffers");
     ret = SynchronizeBuffers();
     if (ret != DEVICE_OK)
-        return ret;
+        return failInitialize(ret);
 
     double low = 0.0;
     double high = 0.0;
@@ -439,7 +447,7 @@ int SaperaGigE::Initialize()
     // --------------------------
     ret = UpdateStatus();
     if (ret != DEVICE_OK)
-        return ret;
+        return failInitialize(ret);
 
     initialized_ = true;
     return DEVICE_OK;
@@ -505,15 +513,34 @@ int SaperaGigE::DestroySaperaPipeline_()
     // destroying Roi_ while Xfer_ is still live causes cormem.sys to BSOD (0x1230).
     if (Roi_ && *Roi_ && !Roi_->Destroy()) ret = DEVICE_ERR;
     if (Buffers_ && !Buffers_->Destroy()) ret = DEVICE_ERR;
-    delete AcqDeviceToBuf_;
+
+    // Do not delete these Sapera++ wrappers on final shutdown. Their Destroy() methods
+    // have released the driver/kernel handles above; running the wrapper destructors during
+    // application exit or after a disturbed camera link has repeatedly reached cormem.sys'
+    // fragile MmUnmapLockedPages path (bugcheck 0x1a/0x1230). Intentionally leaking this
+    // small amount of process memory is preferable to a system crash, and the OS reclaims it
+    // when the Python/MMCore process exits.
     AcqDeviceToBuf_ = NULL;
     Xfer_ = NULL;
-    delete Conv_;
     Conv_ = NULL;
+    Roi_ = NULL;
+    Buffers_ = NULL;
+    return ret;
+}
+
+int SaperaGigE::DestroySaperaPipelineForReconfigure_()
+{
+    // Reconfiguration needs the SDK objects Destroy()ed in dependency order, but deleting
+    // and reconstructing SapAcqDeviceToBuf/SapBufferWithTrash has proven to exercise an
+    // unstable cormem.sys unmap path. Keep the long-lived C++ wrappers and re-Create() them
+    // below; only the ROI wrapper changes because its geometry is constructor-only.
+    int ret = DEVICE_OK;
+    if (Xfer_ && *Xfer_ && !Xfer_->Destroy()) ret = DEVICE_ERR;
+    if (Conv_ && *Conv_ && !Conv_->Destroy()) ret = DEVICE_ERR;
+    if (Roi_ && *Roi_ && !Roi_->Destroy()) ret = DEVICE_ERR;
     delete Roi_;
     Roi_ = NULL;
-    delete Buffers_;
-    Buffers_ = NULL;
+    if (Buffers_ && *Buffers_ && !Buffers_->Destroy()) ret = DEVICE_ERR;
     return ret;
 }
 
@@ -1485,7 +1512,7 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
         if (!Xfer_->Wait(5000))
             LogMessage("Timed out waiting for transfer to stop during buffer reconfiguration");
     }
-    int destroyRet = DestroySaperaPipeline_();
+    int destroyRet = DestroySaperaPipelineForReconfigure_();
 
     // default value
     //
@@ -1527,10 +1554,13 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
     if (isColor_)
         bytesPerPixel_ = 4; // Conv_ always normalizes to 32-bit BGRA (SapFormatRGB8888)
 
-    Buffers_ = new SapBufferWithTrash(3, &AcqDevice_);
-    AcqDeviceToBuf_ = new SapAcqDeviceToBuf(&AcqDevice_, Buffers_, XferCallback, this);
-    Xfer_ = AcqDeviceToBuf_;
-    if (isColor_)
+    if (Buffers_ == NULL)
+    {
+        Buffers_ = new SapBufferWithTrash(3, &AcqDevice_);
+        AcqDeviceToBuf_ = new SapAcqDeviceToBuf(&AcqDevice_, Buffers_, XferCallback, this);
+        Xfer_ = AcqDeviceToBuf_;
+    }
+    if (isColor_ && Conv_ == NULL)
         Conv_ = new SapColorConversion(&AcqDevice_, Buffers_);
     // Use whatever ROI coordinates are currently stored. Callers that change frame geometry
     // (OnBinning, OnWidth, OnHeight) reset roiX_/roiY_/roiW_/roiH_ to 0,0,-1,-1 before
@@ -1552,21 +1582,21 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
     }
     if (!Buffers_->Create())
     {
-        int ret = DestroySaperaPipeline_();
+        int ret = DestroySaperaPipelineForReconfigure_();
         if (ret != DEVICE_OK)
             return ret;
         return DEVICE_NATIVE_MODULE_FAILED;
     }
     if (!Roi_->Create())
     {
-        int ret = DestroySaperaPipeline_();
+        int ret = DestroySaperaPipelineForReconfigure_();
         if (ret != DEVICE_OK)
             return ret;
         return DEVICE_NATIVE_MODULE_FAILED;
     }
     if (isColor_ && !Conv_->Create())
     {
-        int ret = DestroySaperaPipeline_();
+        int ret = DestroySaperaPipelineForReconfigure_();
         if (ret != DEVICE_OK)
             return ret;
         return DEVICE_NATIVE_MODULE_FAILED;
@@ -1578,7 +1608,7 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
     }
     if (Xfer_ && !Xfer_->Create())
     {
-        int ret = DestroySaperaPipeline_();
+        int ret = DestroySaperaPipelineForReconfigure_();
         if (ret != DEVICE_OK)
             return ret;
         return DEVICE_NATIVE_MODULE_FAILED;

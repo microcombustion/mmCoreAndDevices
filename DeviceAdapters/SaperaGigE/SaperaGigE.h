@@ -209,6 +209,7 @@ private:
 
     int FreeHandles();
     int DestroySaperaPipeline_();
+    int DestroySaperaPipelineForReconfigure_();
     int SetUpBinningProperties();
     int SetUpFrameRateProperty();
     bool IsFeatureAvailable(const char* featureName);
