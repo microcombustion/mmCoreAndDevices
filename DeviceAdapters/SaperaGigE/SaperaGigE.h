@@ -36,6 +36,7 @@
 #include <condition_variable>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <string>
 #include <iterator>
 #include <map>
@@ -180,7 +181,6 @@ private:
     int NumberOfWorkableCameras_;
     int GetListOfAvailableCameras();
     SapAcqDevice AcqDevice_;
-    SapAcqDevice CurrentDevice_;
     // Buffers_/AcqDeviceToBuf_/Xfer_ are owned as a unit and rebuilt together whenever
     // SynchronizeBuffers() changes a feature that affects Sapera buffer layout. Never
     // reassign SapAcqDeviceToBuf from a freshly-constructed temporary: its constructor

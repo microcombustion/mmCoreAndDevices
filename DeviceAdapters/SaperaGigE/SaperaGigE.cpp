@@ -77,7 +77,7 @@ std::wstring s2ws(const std::string& s)
 
 int ErrorBox(std::string text, std::string caption)
 {
-    return MessageBox(NULL, s2ws(caption).c_str(), s2ws(text).c_str(), (MB_ICONERROR | MB_OK));
+    return MessageBox(NULL, s2ws(text).c_str(), s2ws(caption).c_str(), (MB_ICONERROR | MB_OK));
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -215,7 +215,7 @@ int SaperaGigE::OnCamera(MM::PropertyBase* pProp, MM::ActionType eAct)
             }
 
         }
-        assert(!"Unrecognized Camera");
+        return DEVICE_INVALID_INPUT_PARAM;
     }
     return DEVICE_OK;
 }
@@ -299,7 +299,7 @@ int SaperaGigE::Initialize()
     // set property list
     // -----------------
 
-    std::map< const char*, feature > deviceFeatures;
+    std::map<std::string, feature> deviceFeatures;
 
     deviceFeatures[MM::g_Keyword_PixelType] = define_feature("PixelFormat", false,
         new CPropertyAction(this, &SaperaGigE::OnPixelType));
@@ -348,7 +348,7 @@ int SaperaGigE::Initialize()
 
     // device features
     //for (auto const& x : deviceFeatures)
-    std::map< const char*, feature >::iterator x;
+    std::map<std::string, feature>::iterator x;
     for (x = deviceFeatures.begin(); x != deviceFeatures.end(); x++)
     {
         feature f = x->second;
@@ -358,6 +358,7 @@ int SaperaGigE::Initialize()
         {
             LogMessage((std::string)"Feature '" + f.name
                 + "' is not supported");
+            delete f.action;
             continue;
         }
 
@@ -383,9 +384,9 @@ int SaperaGigE::Initialize()
         }
 
         if (f.action == NULL)
-            ret = CreateProperty(x->first, value, eType, f.readOnly);
+            ret = CreateProperty(x->first.c_str(), value, eType, f.readOnly);
         else
-            ret = CreateProperty(x->first, value, eType, f.readOnly, f.action);
+            ret = CreateProperty(x->first.c_str(), value, eType, f.readOnly, f.action);
         assert(ret == DEVICE_OK);
 
         if (sapType == SapFeature::TypeEnum)
@@ -407,7 +408,7 @@ int SaperaGigE::Initialize()
                 AcqFeature_.GetEnumString(i, value, sizeof(value));
                 allowed.push_back(value);
             }
-            ret = SetAllowedValues(x->first, allowed);
+            ret = SetAllowedValues(x->first.c_str(), allowed);
             assert(ret == DEVICE_OK);
         }
     }
@@ -433,15 +434,17 @@ int SaperaGigE::Initialize()
 
     // Set up gain
     AcqDevice_.GetFeatureInfo("Gain", &AcqFeature_);
-    AcqFeature_.GetMax(&high);
-    AcqFeature_.GetMin(&low);
-    SetPropertyLimits(MM::g_Keyword_Gain, low, high);
+    if (AcqFeature_.GetMax(&high) && AcqFeature_.GetMin(&low))
+        SetPropertyLimits(MM::g_Keyword_Gain, low, high);
+    else
+        LogMessage("Failed to read gain limits");
 
     // Set up exposure
     AcqDevice_.GetFeatureInfo("ExposureTime", &AcqFeature_);
-    AcqFeature_.GetMin(&low); // us
-    AcqFeature_.GetMax(&high); // us
-    SetPropertyLimits(MM::g_Keyword_Exposure, low / 1000., high / 1000.);
+    if (AcqFeature_.GetMin(&low) && AcqFeature_.GetMax(&high)) // us
+        SetPropertyLimits(MM::g_Keyword_Exposure, low / 1000., high / 1000.);
+    else
+        LogMessage("Failed to read exposure limits");
 
     // synchronize all properties
     // --------------------------
@@ -570,6 +573,7 @@ int SaperaGigE::SnapImage()
     else if (!Xfer_->Wait(16000))
     {
         // Wait for either the capture to finish or 16 seconds, whichever is first.
+        Xfer_->Freeze();
         ret = DEVICE_ERR;
     }
     {
@@ -594,6 +598,11 @@ int SaperaGigE::SnapImage()
 const unsigned char* SaperaGigE::GetImageBuffer()
 {
     std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
+    if (!Buffers_ || !Roi_ || (isColor_ && !Conv_))
+    {
+        LogMessage("Sapera pipeline is not ready in GetImageBuffer");
+        return NULL;
+    }
     // For a color sensor, demosaic the just-acquired raw Bayer buffer into Conv_'s RGB
     // output buffer before reading pixels out of it. The SDK demos instead drive Convert()
     // asynchronously through a SapProcessing helper (Execute()/ProCallback) so a live-preview
@@ -604,7 +613,11 @@ const unsigned char* SaperaGigE::GetImageBuffer()
     SapBuffer* src = Buffers_;
     if (isColor_)
     {
-        Conv_->Convert();
+        if (!Conv_->Convert())
+        {
+            LogMessage("Sapera color conversion failed in GetImageBuffer");
+            return NULL;
+        }
         src = Conv_->GetOutputBuffer();
     }
     // Put Sapera buffer into Micro-Manager Buffer
@@ -659,6 +672,8 @@ unsigned SaperaGigE::GetNumberOfComponents() const
 */
 unsigned SaperaGigE::GetBitDepth() const
 {
+    if (isColor_)
+        return 8;
     return bitsPerPixel_;
 }
 
@@ -728,8 +743,22 @@ int SaperaGigE::GetROI(unsigned& x, unsigned& y, unsigned& xSize, unsigned& ySiz
     {
         x = (unsigned)roiX_;
         y = (unsigned)roiY_;
-        xSize = (roiW_ > 0) ? (unsigned)roiW_ : 0;
-        ySize = (roiH_ > 0) ? (unsigned)roiH_ : 0;
+        if (roiW_ > 0)
+            xSize = (unsigned)roiW_;
+        else
+        {
+            UINT32 width = img_.Width();
+            AcqDevice_.GetFeatureValue("Width", &width);
+            xSize = width;
+        }
+        if (roiH_ > 0)
+            ySize = (unsigned)roiH_;
+        else
+        {
+            UINT32 height = img_.Height();
+            AcqDevice_.GetFeatureValue("Height", &height);
+            ySize = height;
+        }
         return DEVICE_OK;
     }
     x = Roi_->GetXMin();
@@ -982,12 +1011,7 @@ bool SaperaGigE::IsFeatureAvailable(const char* featureName)
 {
     std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
     BOOL isAvailable = FALSE;
-    if (!AcqDevice_.IsFeatureAvailable(featureName, &isAvailable) || !isAvailable)
-    {
-        LogMessage((std::string)"Feature '" + featureName + "' is not supported or currently unavailable");
-        return false;
-    }
-    return true;
+    return AcqDevice_.IsFeatureAvailable(featureName, &isAvailable) && isAvailable;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1029,7 +1053,8 @@ int SaperaGigE::OnBinningMode(MM::PropertyBase* pProp, MM::ActionType eAct)
             return DEVICE_INVALID_PROPERTY;
         std::string value;
         pProp->Get(value);
-        AcqDevice_.SetFeatureValue("binningMode", value.c_str());
+        if (!AcqDevice_.SetFeatureValue("binningMode", value.c_str()))
+            return DEVICE_ERR;
     }
     // MM::BeforeGet returns the value cached in the property.
     return DEVICE_OK;
@@ -1224,6 +1249,8 @@ int SaperaGigE::OnTemperature(MM::PropertyBase* pProp, MM::ActionType eAct)
     }
     else if (eAct == MM::BeforeGet)
     {
+        // Avoid SDK calls while the callback owns Sapera buffers; the cached temperature is
+        // good enough during acquisition and prevents frame drops from lock contention.
         if (IsCapturing())
             return DEVICE_OK;
         if (!IsFeatureAvailable("DeviceTemperature"))
@@ -1246,7 +1273,7 @@ int SaperaGigE::OnTemperature(MM::PropertyBase* pProp, MM::ActionType eAct)
 int SaperaGigE::OnPixelType(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
     std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
-    char pixelFormat[10];
+    char pixelFormat[MM::MaxStrLength];
     if (!IsFeatureAvailable("PixelFormat"))
         return DEVICE_INVALID_PROPERTY;
     if (!AcqDevice_.GetFeatureValue("PixelFormat", pixelFormat, sizeof(pixelFormat)))
@@ -1523,6 +1550,7 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
     // and only report the failure (after that rebuild leaves the device in a working state)
     // via pixelFormatFailed below.
     bool pixelFormatFailed = false;
+    bool featureSetFailed = false;
     if (pixelFormat.size())
     {
         if (!AcqDevice_.SetFeatureValue("PixelFormat", pixelFormat.c_str()))
@@ -1535,17 +1563,26 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
     if (width > 0)
     {
         if (!AcqDevice_.SetFeatureValue("Width", width))
+        {
             LogMessage("Failed to set feature value for 'Width'");
+            featureSetFailed = true;
+        }
     }
     if (height > 0)
     {
         if (!AcqDevice_.SetFeatureValue("Height", height))
+        {
             LogMessage("Failed to set feature value for 'Height'");
+            featureSetFailed = true;
+        }
     }
     if (timeout > 0)
     {
         if (!AcqDevice_.SetFeatureValue("ImageTimeout", timeout))
+        {
             LogMessage("Failed to set feature value for 'ImageTimeout'");
+            featureSetFailed = true;
+        }
     }
 
     // synchronize bit depth with camera
@@ -1575,9 +1612,11 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
         // until after Conv_->Create() below.
         if (!Conv_->Enable(TRUE, FALSE))
         {
-            LogMessage("Color conversion not supported on this camera; falling back to raw passthrough");
-            isColor_ = false;
-            bytesPerPixel_ = (bitsPerPixel_ + 7) / 8;
+            LogMessage("Color conversion not supported on this camera");
+            int ret = DestroySaperaPipelineForReconfigure_();
+            if (ret != DEVICE_OK)
+                return ret;
+            return DEVICE_NATIVE_MODULE_FAILED;
         }
     }
     if (!Buffers_->Create())
@@ -1624,6 +1663,8 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
         return destroyRet;
     if (pixelFormatFailed)
         return DEVICE_INVALID_PROPERTY_VALUE;
+    if (featureSetFailed)
+        return DEVICE_ERR;
 
     return DEVICE_OK;
 }
@@ -1686,7 +1727,12 @@ void SaperaGigE::XferCallback(SapXferCallbackInfo* pInfo)
     SapBuffer* src = self->Buffers_;
     if (self->isColor_)
     {
-        self->Conv_->Convert();
+        if (!self->Conv_->Convert())
+        {
+            self->LogMessage("Sapera color conversion failed in transfer callback; stopping sequence");
+            self->RequestStop();
+            return;
+        }
         src = self->Conv_->GetOutputBuffer();
     }
 
@@ -1743,7 +1789,7 @@ int SaperaGigE::SetUpBinningProperties()
         return ret;
 
     INT64 bin, min, max, inc;
-    std::vector<std::string> vValues, hValues, binValues;
+    std::set<INT64> vValues, hValues, binValues;
 
     // vertical binning
     if (!AcqDevice_.SetFeatureValue("BinningVertical", 1))
@@ -1757,7 +1803,7 @@ int SaperaGigE::SetUpBinningProperties()
     AcqFeature_.GetMax(&max);
     AcqFeature_.GetInc(&inc);
     for (INT64 i = min; i <= max; i += inc)
-        vValues.push_back(std::to_string(i));
+        vValues.insert(i);
 
     // horizontal binning
     if (!AcqDevice_.SetFeatureValue("BinningHorizontal", 1))
@@ -1771,23 +1817,27 @@ int SaperaGigE::SetUpBinningProperties()
     AcqFeature_.GetMax(&max);
     AcqFeature_.GetInc(&inc);
     for (INT64 i = min; i <= max; i += inc)
-        hValues.push_back(std::to_string(i));
+        hValues.insert(i);
 
     // possible uniform binning values.
     if (vValues.empty() && hValues.empty())
-        binValues.push_back("1");
+        binValues.insert(1);
     else if (vValues.empty())
         binValues = hValues;
     else if (hValues.empty())
         binValues = vValues;
     else {
-        binValues.reserve(vValues.size() + hValues.size());
         std::set_union(vValues.begin(), vValues.end(),
             hValues.begin(), hValues.end(),
-            std::back_inserter(binValues));
+            std::inserter(binValues, binValues.begin()));
     }
 
-    return SetAllowedValues(MM::g_Keyword_Binning, binValues);
+    std::vector<std::string> allowed;
+    allowed.reserve(binValues.size());
+    for (std::set<INT64>::const_iterator value = binValues.begin(); value != binValues.end(); ++value)
+        allowed.push_back(std::to_string(*value));
+
+    return SetAllowedValues(MM::g_Keyword_Binning, allowed);
 }
 
 /**
