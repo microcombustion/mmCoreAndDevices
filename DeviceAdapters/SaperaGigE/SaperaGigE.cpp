@@ -477,16 +477,14 @@ int SaperaGigE::Shutdown()
 
     // Guard: after a failed SynchronizeBuffers() rebuild, Xfer_ may be NULL even with
     // initialized_ true. FreeHandles() is still safe to call (it null-checks everything).
+    //
+    // Do NOT call Xfer_->Freeze() here. If a sequence was running, the RequestStop()+join()
+    // above already ran performTeardown_(), which called Freeze()+Wait(). Calling Freeze() a
+    // second time on an already-frozen Grab transfer causes cormem.sys to BSOD
+    // (0x1a/0x1230/MmUnmapLockedPages). In all other states (snap only, never-started,
+    // PrepareForAcq-failed) the transfer is already idle or was already explicitly frozen
+    // inline, so no additional Freeze() is needed before Destroy().
     std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
-    if (Xfer_)
-    {
-        Xfer_->Freeze();
-        // Log a timeout but always proceed to FreeHandles(): leaving Sapera kernel objects
-        // live (and cormem.sys holding DMA-locked pages) is exactly the state that produces
-        // a 0x1a/0x1230 BSOD on the next process that initializes the driver.
-        if (!Xfer_->Wait(5000))
-            LogMessage("Timed out waiting for transfer to stop during shutdown");
-    }
     return FreeHandles();
 }
 
@@ -541,7 +539,10 @@ int SaperaGigE::DestroySaperaPipelineForReconfigure_()
     if (Xfer_ && *Xfer_ && !Xfer_->Destroy()) ret = DEVICE_ERR;
     if (Conv_ && *Conv_ && !Conv_->Destroy()) ret = DEVICE_ERR;
     if (Roi_ && *Roi_ && !Roi_->Destroy()) ret = DEVICE_ERR;
-    delete Roi_;
+    // Intentionally not deleting: SapBufferRoi's destructor can reach cormem.sys's fragile
+    // MmUnmapLockedPages path (0x1230 BSOD) even after a successful Destroy(), for the same
+    // reason the wrapper destructors are never run in DestroySaperaPipeline_(). Leak this
+    // small user-space wrapper; the OS reclaims it on process exit.
     Roi_ = NULL;
     if (Buffers_ && *Buffers_ && !Buffers_->Destroy()) ret = DEVICE_ERR;
     return ret;
@@ -1531,14 +1532,11 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
 
     // Callers only reach here with the transfer idle: OnPixelType/OnWidth/OnHeight etc.
     // reject via IsCapturing() while a sequence is running, and SnapImage() already blocks
-    // on Wait() before returning. Freeze()/Wait() is still used as a conservative Sapera
-    // driver barrier before cormem.sys is asked to unmap the old buffers.
-    if (Xfer_ && *Xfer_)
-    {
-        Xfer_->Freeze();
-        if (!Xfer_->Wait(5000))
-            LogMessage("Timed out waiting for transfer to stop during buffer reconfiguration");
-    }
+    // on Wait() before returning. Do NOT call Freeze() here: live-view stop (performTeardown_)
+    // already called Freeze()+Wait() before this point, and a second Freeze() on an already-
+    // frozen Grab transfer causes cormem.sys to BSOD (0x1230/MmUnmapLockedPages). The callers'
+    // IsCapturing() guard, combined with saperaMutex_ held throughout, is sufficient to ensure
+    // no racing acquisition can start between the IsCapturing() check and Destroy() below.
     int destroyRet = DestroySaperaPipelineForReconfigure_();
 
     // default value
