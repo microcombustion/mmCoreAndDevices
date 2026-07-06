@@ -101,7 +101,6 @@ SaperaGigE::SaperaGigE() :
     numImages_(0),
     stopRequested_(false),
     Buffers_(NULL),
-    Roi_(NULL),
     roiX_(0),
     roiY_(0),
     roiW_(-1),
@@ -506,14 +505,26 @@ int SaperaGigE::DestroySaperaPipeline_()
     // Accumulate errors but attempt every destroy: an early return on first failure leaves
     // later kernel objects live, which is exactly the state cormem.sys cannot safely clean
     // up after a process exit (0x1a/0x1230 BSOD on the next init).
+    //
+    // A failed Destroy() is logged per object: it leaves the wrapper's user-space
+    // bookkeeping out of sync with the kernel buffer state, which is the prime suspect
+    // for the stale-mapping double-unmap that bugchecks cormem.sys later (see BSOD.md).
     int ret = DEVICE_OK;
-    if (Xfer_ && *Xfer_ && !Xfer_->Destroy()) ret = DEVICE_ERR;
-    if (Conv_ && *Conv_ && !Conv_->Destroy()) ret = DEVICE_ERR;
-    // Roi_ (SapBufferRoi child) must be destroyed after Xfer_ but before its parent Buffers_.
-    // Xfer_ holds references to all child buffer handles including Roi_'s m_hTrashChild;
-    // destroying Roi_ while Xfer_ is still live causes cormem.sys to BSOD (0x1230).
-    if (Roi_ && *Roi_ && !Roi_->Destroy()) ret = DEVICE_ERR;
-    if (Buffers_ && *Buffers_ && !Buffers_->Destroy()) ret = DEVICE_ERR;
+    if (Xfer_ && *Xfer_ && !Xfer_->Destroy())
+    {
+        LogMessage("Xfer_->Destroy() failed in DestroySaperaPipeline_");
+        ret = DEVICE_ERR;
+    }
+    if (Conv_ && *Conv_ && !Conv_->Destroy())
+    {
+        LogMessage("Conv_->Destroy() failed in DestroySaperaPipeline_");
+        ret = DEVICE_ERR;
+    }
+    if (Buffers_ && *Buffers_ && !Buffers_->Destroy())
+    {
+        LogMessage("Buffers_->Destroy() failed in DestroySaperaPipeline_");
+        ret = DEVICE_ERR;
+    }
 
     // Do not delete these Sapera++ wrappers on final shutdown. Their Destroy() methods
     // have released the driver/kernel handles above; running the wrapper destructors during
@@ -524,7 +535,6 @@ int SaperaGigE::DestroySaperaPipeline_()
     AcqDeviceToBuf_ = NULL;
     Xfer_ = NULL;
     Conv_ = NULL;
-    Roi_ = NULL;
     Buffers_ = NULL;
     return ret;
 }
@@ -532,19 +542,27 @@ int SaperaGigE::DestroySaperaPipeline_()
 int SaperaGigE::DestroySaperaPipelineForReconfigure_()
 {
     // Reconfiguration needs the SDK objects Destroy()ed in dependency order, but deleting
-    // and reconstructing SapAcqDeviceToBuf/SapBufferWithTrash has proven to exercise an
+    // and reconstructing SapAcqDeviceToBuf/SapBuffer has proven to exercise an
     // unstable cormem.sys unmap path. Keep the long-lived C++ wrappers and re-Create() them
-    // below; only the ROI wrapper changes because its geometry is constructor-only.
+    // below.
+    //
+    // A failed Destroy() is logged per object -- see DestroySaperaPipeline_() for why.
     int ret = DEVICE_OK;
-    if (Xfer_ && *Xfer_ && !Xfer_->Destroy()) ret = DEVICE_ERR;
-    if (Conv_ && *Conv_ && !Conv_->Destroy()) ret = DEVICE_ERR;
-    if (Roi_ && *Roi_ && !Roi_->Destroy()) ret = DEVICE_ERR;
-    // Intentionally not deleting: SapBufferRoi's destructor can reach cormem.sys's fragile
-    // MmUnmapLockedPages path (0x1230 BSOD) even after a successful Destroy(), for the same
-    // reason the wrapper destructors are never run in DestroySaperaPipeline_(). Leak this
-    // small user-space wrapper; the OS reclaims it on process exit.
-    Roi_ = NULL;
-    if (Buffers_ && *Buffers_ && !Buffers_->Destroy()) ret = DEVICE_ERR;
+    if (Xfer_ && *Xfer_ && !Xfer_->Destroy())
+    {
+        LogMessage("Xfer_->Destroy() failed in DestroySaperaPipelineForReconfigure_");
+        ret = DEVICE_ERR;
+    }
+    if (Conv_ && *Conv_ && !Conv_->Destroy())
+    {
+        LogMessage("Conv_->Destroy() failed in DestroySaperaPipelineForReconfigure_");
+        ret = DEVICE_ERR;
+    }
+    if (Buffers_ && *Buffers_ && !Buffers_->Destroy())
+    {
+        LogMessage("Buffers_->Destroy() failed in DestroySaperaPipelineForReconfigure_");
+        ret = DEVICE_ERR;
+    }
     return ret;
 }
 
@@ -599,7 +617,9 @@ int SaperaGigE::SnapImage()
 const unsigned char* SaperaGigE::GetImageBuffer()
 {
     std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
-    if (!Buffers_ || !Roi_ || (isColor_ && !Conv_))
+    // *Buffers_ is the SDK's is-created check: after a failed SynchronizeBuffers()
+    // rebuild the wrapper pointer is still non-null but its kernel resources are gone.
+    if (!Buffers_ || !*Buffers_ || (isColor_ && !Conv_))
     {
         LogMessage("Sapera pipeline is not ready in GetImageBuffer");
         return NULL;
@@ -621,8 +641,9 @@ const unsigned char* SaperaGigE::GetImageBuffer()
         }
         src = Conv_->GetOutputBuffer();
     }
-    // Put Sapera buffer into Micro-Manager Buffer
-    src->ReadRect(Roi_->GetXMin(), Roi_->GetYMin(), img_.Width(), img_.Height(),
+    // Put Sapera buffer into Micro-Manager Buffer (software ROI crop: img_ is sized to
+    // the ROI by ResizeImageBuffer(), roiX_/roiY_ position it within the full frame)
+    src->ReadRect(roiX_, roiY_, img_.Width(), img_.Height(),
         const_cast<unsigned char*>(img_.GetPixels()));
     // Return location of the Micro-Manager Buffer
     return const_cast<unsigned char*>(img_.GetPixels());
@@ -695,8 +716,8 @@ long SaperaGigE::GetImageBufferSize() const
 * exact dimensions requested - but should try do as close as possible.
 * If the hardware does not have this capability the software should simulate the ROI by
 * appropriately cropping each frame.
-* This adapter rebuilds the Sapera ROI/buffer/transfer chain so the Micro-Manager
-* image buffer matches the requested ROI.
+* This adapter simulates the ROI in software: the transfer always delivers full frames,
+* and each frame is cropped via ReadRect into the ROI-sized Micro-Manager image buffer.
 * @param x - top-left corner coordinate
 * @param y - top-left corner coordinate
 * @param xSize - width
@@ -711,9 +732,9 @@ int SaperaGigE::SetROI(unsigned x, unsigned y, unsigned xSize, unsigned ySize)
     LogMessage((std::string)"Setting Region of Interest");
     if (xSize == 0 && ySize == 0)
         return ClearROI();
-    // Validate against the current full-frame dimensions before tearing down. An out-of-range
-    // ROI would make SapBufferRoi::Create() fail mid-rebuild, leaving the adapter in a broken
-    // state (Xfer_/Roi_ null, initialized_ true). Also catches xSize==0 or ySize==0 alone.
+    // Validate against the current full-frame dimensions. An out-of-range ROI would make
+    // the ReadRect crop read outside the acquired frame. Also catches xSize==0 or
+    // ySize==0 alone.
     UINT32 fullWidth = 0, fullHeight = 0;
     if (!IsFeatureAvailable("Width") || !IsFeatureAvailable("Height"))
         return DEVICE_INVALID_PROPERTY;
@@ -723,13 +744,14 @@ int SaperaGigE::SetROI(unsigned x, unsigned y, unsigned xSize, unsigned ySize)
     if (xSize == 0 || ySize == 0 ||
         (UINT32)x + xSize > fullWidth || (UINT32)y + ySize > fullHeight)
         return DEVICE_INVALID_INPUT_PARAM;
-    // Changing ROI requires a full Sapera chain teardown/rebuild (Roi_ → Xfer_ → Conv_ →
-    // Buffers_). Destroying/creating Roi_ alone while Buffers_ is live causes cormem.sys
-    // to call MmUnmapLockedPages on still-active DMA pages → BSOD. SynchronizeBuffers()
-    // performs the full safe sequence and calls ResizeImageBuffer() at the end, which
-    // (after the update below) uses roiW_/roiH_ to size img_ correctly.
+    // The ROI is a pure software crop: the transfer always delivers full frames into
+    // Buffers_, and GetImageBuffer()/XferCallback ReadRect the ROI region out of them.
+    // No Sapera object is affected, so no pipeline teardown/rebuild is needed -- only
+    // img_ must be resized to the new ROI. (Historically this went through
+    // SynchronizeBuffers() because a SapBufferRoi child buffer was rebuilt here; that
+    // object was never connected to the transfer and has been removed, see BSOD.md.)
     roiX_ = (int)x; roiY_ = (int)y; roiW_ = (int)xSize; roiH_ = (int)ySize;
-    return SynchronizeBuffers();
+    return ResizeImageBuffer();
 }
 
 /**
@@ -739,33 +761,24 @@ int SaperaGigE::SetROI(unsigned x, unsigned y, unsigned xSize, unsigned ySize)
 int SaperaGigE::GetROI(unsigned& x, unsigned& y, unsigned& xSize, unsigned& ySize)
 {
     std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
-    // Roi_ can be null if SynchronizeBuffers() failed mid-rebuild; fall back to stored coords.
-    if (!Roi_)
+    x = (unsigned)roiX_;
+    y = (unsigned)roiY_;
+    if (roiW_ > 0)
+        xSize = (unsigned)roiW_;
+    else
     {
-        x = (unsigned)roiX_;
-        y = (unsigned)roiY_;
-        if (roiW_ > 0)
-            xSize = (unsigned)roiW_;
-        else
-        {
-            UINT32 width = img_.Width();
-            AcqDevice_.GetFeatureValue("Width", &width);
-            xSize = width;
-        }
-        if (roiH_ > 0)
-            ySize = (unsigned)roiH_;
-        else
-        {
-            UINT32 height = img_.Height();
-            AcqDevice_.GetFeatureValue("Height", &height);
-            ySize = height;
-        }
-        return DEVICE_OK;
+        UINT32 width = img_.Width();
+        AcqDevice_.GetFeatureValue("Width", &width);
+        xSize = width;
     }
-    x = Roi_->GetXMin();
-    y = Roi_->GetYMin();
-    xSize = Roi_->GetWidth();
-    ySize = Roi_->GetHeight();
+    if (roiH_ > 0)
+        ySize = (unsigned)roiH_;
+    else
+    {
+        UINT32 height = img_.Height();
+        AcqDevice_.GetFeatureValue("Height", &height);
+        ySize = height;
+    }
     return DEVICE_OK;
 }
 
@@ -779,9 +792,9 @@ int SaperaGigE::ClearROI()
     // img_ geometry must stay stable while the callback is streaming into it.
     if (IsCapturing())
         return DEVICE_CAMERA_BUSY_ACQUIRING;
-    // Same teardown requirement as SetROI: full chain rebuild via SynchronizeBuffers().
+    // Software crop only -- same as SetROI, no Sapera teardown needed.
     roiX_ = 0; roiY_ = 0; roiW_ = -1; roiH_ = -1;
-    return SynchronizeBuffers();
+    return ResizeImageBuffer();
 }
 
 /**
@@ -1591,16 +1604,14 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
 
     if (Buffers_ == NULL)
     {
-        Buffers_ = new SapBufferWithTrash(3, &AcqDevice_);
+        // Plain SapBuffer, no trash resource -- see the Buffers_ declaration comment
+        // and BSOD.md section 5 for why.
+        Buffers_ = new SapBuffer(3, &AcqDevice_);
         AcqDeviceToBuf_ = new SapAcqDeviceToBuf(&AcqDevice_, Buffers_, XferCallback, this);
         Xfer_ = AcqDeviceToBuf_;
     }
     if (isColor_ && Conv_ == NULL)
         Conv_ = new SapColorConversion(&AcqDevice_, Buffers_);
-    // Use whatever ROI coordinates are currently stored. Callers that change frame geometry
-    // (OnBinning, OnWidth, OnHeight) reset roiX_/roiY_/roiW_/roiH_ to 0,0,-1,-1 before
-    // calling here. SetROI()/ClearROI() set the desired values before calling here.
-    Roi_ = new SapBufferRoi(Buffers_, roiX_, roiY_, roiW_, roiH_);
     if (isColor_)
     {
         // Per the SDK's own GigEBayerDemo: Enable() may need to modify the acquisition's
@@ -1618,13 +1629,6 @@ int SaperaGigE::SynchronizeBuffers(std::string pixelFormat, int width, int heigh
         }
     }
     if (!Buffers_->Create())
-    {
-        int ret = DestroySaperaPipelineForReconfigure_();
-        if (ret != DEVICE_OK)
-            return ret;
-        return DEVICE_NATIVE_MODULE_FAILED;
-    }
-    if (!Roi_->Create())
     {
         int ret = DestroySaperaPipelineForReconfigure_();
         if (ret != DEVICE_OK)
@@ -1700,6 +1704,8 @@ void SaperaGigE::XferCallback(SapXferCallbackInfo* pInfo)
     }
 
     // Buffer overflow: drop the frame and log it (no blocking MessageBox dialog).
+    // Inert with the current plain SapBuffer (no trash buffer, so IsTrash() never
+    // fires); kept so reverting Buffers_ to SapBufferWithTrash needs no other change.
     if (pInfo->IsTrash())
     {
         self->LogMessage((std::string)"Frame(s) acquired in trash buffer: "
@@ -1736,7 +1742,8 @@ void SaperaGigE::XferCallback(SapXferCallbackInfo* pInfo)
 
     // Read the just-completed buffer (the no-index ReadRect reads at GetIndex(), the last
     // grabbed buffer) into the single staging buffer img_, then push to the core.
-    src->ReadRect(self->Roi_->GetXMin(), self->Roi_->GetYMin(),
+    // roiX_/roiY_ position the software-ROI crop; img_ is sized to the ROI.
+    src->ReadRect(self->roiX_, self->roiY_,
         self->img_.Width(), self->img_.Height(),
         const_cast<unsigned char*>(self->img_.GetPixels()));
     saperaGuard.unlock();

@@ -187,15 +187,20 @@ private:
     // registers a transfer pair that stores a pointer back to the constructed instance
     // (see AddPair() in the Sapera++ SDK), so assigning from a temporary leaves that
     // pointer dangling the moment the temporary is destroyed at the end of the statement.
-    SapBufferWithTrash* Buffers_;
-    // Roi_ is a child of Buffers_ (its parent), rebuilt every SynchronizeBuffers() call and
-    // on every SetROI()/ClearROI() call -- unlike Buffers_/AcqDeviceToBuf_ it is NOT
-    // construct-once. Must go through the same Create()/Destroy() discipline as the SDK's own
-    // SapBufferRoi demos. SapBufferRoi::SetRoi()/ResetRoi() are pre-Create() only (the SDK
-    // rejects them after Create() with "Cannot be called after the Create Method"); ROI
-    // geometry is therefore stored in roiX_/roiY_/roiW_/roiH_ and passed to the constructor
-    // every time a new Roi_ is allocated (-1 for roiW_/roiH_ means "full parent extent").
-    SapBufferRoi* Roi_;
+    // Plain SapBuffer (no trash buffer): the trash resource is an extra buffer mapping
+    // registered with the transfer connection, and the 2026-07-06 Active-dump analysis
+    // showed the BSOD is a double-unmap of a connection mapping record inside
+    // SapTransfer::Disconnect (see BSOD.md section 5). Dropping the trash resource
+    // removes one aliased record from that bookkeeping; DalsaPythonConnector uses plain
+    // SapBuffer on this same stack without crashes. Overflow now shows up as dropped/
+    // overwritten frames within the 3-buffer ring instead of trash-buffer events.
+    SapBuffer* Buffers_;
+    // Software ROI geometry. The transfer always delivers full frames into Buffers_;
+    // cropping happens in GetImageBuffer()/XferCallback via ReadRect(roiX_, roiY_, ...)
+    // with img_ sized to the ROI by ResizeImageBuffer(). -1 for roiW_/roiH_ means
+    // "full frame". No SapBufferRoi is used: it was never connected to the transfer or
+    // conversion pipeline, and its per-reconfigure child-buffer/trash-child kernel
+    // objects exercised the fragile cormem.sys locked-page unmap path (see BSOD.md).
     int roiX_, roiY_, roiW_, roiH_;
     SapAcqDeviceToBuf* AcqDeviceToBuf_;
     SapTransfer* Xfer_;
