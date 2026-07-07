@@ -10,6 +10,7 @@
 // AUTHOR:        Robert Frazee, rfraze1@lsu.edu
 //                Ingmar Schoegl, ischoegl@lsu.edu
 //
+// COPYRIGHT:     Louisiana State University, 2026
 // LICENSE:       This file is distributed under the BSD license.
 //                License text is included with the source distribution.
 //
@@ -46,9 +47,6 @@
 // Error codes
 //
 #define ERR_UNKNOWN_MODE         102
-
-std::wstring s2ws(const std::string&);
-int ErrorBox(std::string text, std::string caption);
 
 class SaperaGigE : public CCameraBase<SaperaGigE>
 {
@@ -127,11 +125,8 @@ public:
     int OnExposure(MM::PropertyBase* pProp, MM::ActionType eAct);
     int OnAcquisitionFrameRate(MM::PropertyBase* pProp, MM::ActionType eAct);
     int OnCamera(MM::PropertyBase* pProp, MM::ActionType eAct);//for multiple camera support
-    int OnCameraName(MM::PropertyBase* pProp, MM::ActionType eAct);
 
 private:
-
-    static const int MAX_BIT_DEPTH = 12;
 
     // img_ is the single staging buffer shared by snap (GetImageBuffer) and the
     // streaming XferCallback. During a sequence, only the callback writes img_: snap is
@@ -172,13 +167,10 @@ private:
     void performTeardown_();
 
     int ResizeImageBuffer();
-    void GenerateImage();
 
     std::vector<std::string> acqDeviceList_;
     std::string activeDevice_;
 
-    int NumberOfAvailableCameras_;
-    int NumberOfWorkableCameras_;
     int GetListOfAvailableCameras();
     SapAcqDevice AcqDevice_;
     // Buffers_/AcqDeviceToBuf_/Xfer_ are owned as a unit and rebuilt together whenever

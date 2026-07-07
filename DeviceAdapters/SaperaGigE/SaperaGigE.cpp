@@ -10,6 +10,7 @@
 // AUTHOR:        Robert Frazee, rfraze1@lsu.edu
 //                Ingmar Schoegl, ischoegl@lsu.edu
 //
+// COPYRIGHT:     Louisiana State University, 2026
 // LICENSE:       This file is distributed under the BSD license.
 //                License text is included with the source distribution.
 //
@@ -61,23 +62,6 @@ MODULE_API MM::Device* CreateDevice(const char* deviceName)
 MODULE_API void DeleteDevice(MM::Device* pDevice)
 {
     delete pDevice;
-}
-
-std::wstring s2ws(const std::string& s)
-{
-    int len;
-    int slength = (int)s.length() + 1;
-    len = MultiByteToWideChar(CP_ACP, 0, s.c_str(), slength, 0, 0);
-    wchar_t* buf = new wchar_t[len];
-    MultiByteToWideChar(CP_ACP, 0, s.c_str(), slength, buf, len);
-    std::wstring r(buf);
-    delete[] buf;
-    return r;
-}
-
-int ErrorBox(std::string text, std::string caption)
-{
-    return MessageBox(NULL, s2ws(text).c_str(), s2ws(caption).c_str(), (MB_ICONERROR | MB_OK));
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -138,8 +122,6 @@ SaperaGigE::~SaperaGigE()
         RequestStop();
         stopWorker_.join();
     }
-
-    NumberOfWorkableCameras_ = 0;
 }
 
 int SaperaGigE::GetListOfAvailableCameras()
@@ -155,9 +137,9 @@ int SaperaGigE::GetListOfAvailableCameras()
     }
 
     acqDeviceList_.clear();
-    NumberOfAvailableCameras_ = SapManager::GetServerCount();
+    int numAvailableCameras = SapManager::GetServerCount();
     char serverName[CORSERVER_MAX_STRLEN];
-    for (int serverIndex = 0; serverIndex < NumberOfAvailableCameras_; serverIndex++)
+    for (int serverIndex = 0; serverIndex < numAvailableCameras; serverIndex++)
     {
         if (SapManager::GetResourceCount(serverIndex, SapManager::ResourceAcqDevice) != 0)
         {
@@ -220,21 +202,6 @@ int SaperaGigE::OnCamera(MM::PropertyBase* pProp, MM::ActionType eAct)
 }
 
 /**
-   * Camera Name
-   */
-int SaperaGigE::OnCameraName(MM::PropertyBase* pProp, MM::ActionType eAct)
-{
-    if (eAct == MM::AfterSet)
-    {
-    }
-    else if (eAct == MM::BeforeGet)
-    {
-        pProp->Set(activeDevice_.c_str());
-    }
-    return DEVICE_OK;
-}
-
-/**
 * Intializes the hardware.
 * Typically we access and initialize hardware at this point.
 * Device properties are typically created here as well.
@@ -277,8 +244,6 @@ int SaperaGigE::Initialize()
         int cleanup = FreeHandles();
         return cleanup != DEVICE_OK ? cleanup : error;
     };
-
-    NumberOfWorkableCameras_++;
 
     // Detect a color sensor the same way Sapera's own CamExpert/demo apps do, so
     // SynchronizeBuffers() knows whether to set up Bayer->RGB conversion.
@@ -580,8 +545,20 @@ int SaperaGigE::SnapImage()
             return DEVICE_CAMERA_BUSY_ACQUIRING;
         transferActive_ = true;
     }
-    std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
+    std::unique_lock<std::recursive_mutex> saperaGuard(saperaMutex_);
+    if (!Xfer_ || !*Xfer_)
+    {
+        LogMessage("Sapera pipeline is not ready in SnapImage");
+        MMThreadGuard g(seqLock_);
+        transferActive_ = false;
+        return DEVICE_ERR;
+    }
     int ret = DEVICE_OK;
+    // Wait timeout is derived from the camera's own current exposure limit (see
+    // Initialize()) plus a fixed transfer margin, so a legally long exposure cannot make
+    // Wait() time out and Freeze() abort an in-progress, otherwise-valid frame.
+    double exposureMs = GetExposure();
+    long waitMs = (long)(std::max)(exposureMs + 16000.0, 16000.0);
     // Start image capture
     Xfer_->SetCommandTimeout(1000);
     if (!Xfer_->Snap(1))
@@ -589,11 +566,21 @@ int SaperaGigE::SnapImage()
         LogMessage("Failure occurred while capturing a single image");
         ret = DEVICE_ERR;
     }
-    else if (!Xfer_->Wait(16000))
+    else
     {
-        // Wait for either the capture to finish or 16 seconds, whichever is first.
-        Xfer_->Freeze();
-        ret = DEVICE_ERR;
+        // Release the SDK lock across the blocking wait: seqLock_'s sequenceStarted_/
+        // transferActive_ guard (above) already provides snap/sequence mutual exclusion,
+        // so property handlers (which each lock saperaMutex_ at entry) are not blocked
+        // for the whole exposure.
+        saperaGuard.unlock();
+        bool finished = Xfer_->Wait(waitMs);
+        saperaGuard.lock();
+        if (!finished)
+        {
+            // Wait for either the capture to finish or the timeout, whichever is first.
+            Xfer_->Freeze();
+            ret = DEVICE_ERR;
+        }
     }
     {
         MMThreadGuard g(seqLock_);
@@ -617,6 +604,15 @@ int SaperaGigE::SnapImage()
 const unsigned char* SaperaGigE::GetImageBuffer()
 {
     std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
+    // Reject while a callback-driven sequence owns img_ (see the member's invariant
+    // comment in the header): CMMCore::getImage() can reach this method from the MMCore
+    // thread at any time during a live sequence, racing XferCallback's unlocked
+    // ReadRect-then-InsertImage window and tearing the delivered frame.
+    if (IsCapturing())
+    {
+        LogMessage("GetImageBuffer called while a sequence is active; rejecting");
+        return NULL;
+    }
     // *Buffers_ is the SDK's is-created check: after a failed SynchronizeBuffers()
     // rebuild the wrapper pointer is still non-null but its kernel resources are gone.
     if (!Buffers_ || !*Buffers_ || (isColor_ && !Conv_))
@@ -636,8 +632,19 @@ const unsigned char* SaperaGigE::GetImageBuffer()
     {
         if (!Conv_->Convert())
         {
-            LogMessage("Sapera color conversion failed in GetImageBuffer");
-            return NULL;
+            // A transient Convert() failure must not surface a NULL buffer here: MMCore
+            // passes this pointer to an installed image processor before its own null
+            // check (see CODE_REVIEW.md finding 4), so NULL risks a null-pointer
+            // dereference downstream instead of a clean error. Retry once, then fall back
+            // to re-delivering the last successfully converted frame still held in img_
+            // rather than returning NULL.
+            LogMessage("Sapera color conversion failed in GetImageBuffer; retrying once");
+            if (!Conv_->Convert())
+            {
+                LogMessage("Sapera color conversion failed twice in GetImageBuffer; "
+                    "returning last known-good frame");
+                return const_cast<unsigned char*>(img_.GetPixels());
+            }
         }
         src = Conv_->GetOutputBuffer();
     }
@@ -973,7 +980,9 @@ int SaperaGigE::StartSequenceAcquisition(long numImages, double interval_ms, boo
     }
     {
         std::lock_guard<std::recursive_mutex> saperaGuard(saperaMutex_);
-        if (!Xfer_->Grab())
+        // Mirror GetImageBuffer()'s created-state guard: after a failed reconfigure,
+        // Xfer_ can be non-NULL but Destroy()ed (see DestroySaperaPipelineForReconfigure_).
+        if (!Xfer_ || !*Xfer_ || !Xfer_->Grab())
         {
             MMThreadGuard g(seqLock_);
             transferActive_ = false;
@@ -1100,9 +1109,12 @@ long SaperaGigE::CheckValue(const char* key, long value)
         return value;
     INT64 minVal, maxVal, inc;
     AcqDevice_.GetFeatureInfo(key, &AcqFeature_);
-    AcqFeature_.GetInc(&inc);
-    AcqFeature_.GetMin(&minVal);
-    AcqFeature_.GetMax(&maxVal);
+    if (!AcqFeature_.GetInc(&inc) || inc <= 0)
+        inc = 1;
+    if (!AcqFeature_.GetMin(&minVal))
+        minVal = (std::numeric_limits<long>::min)();
+    if (!AcqFeature_.GetMax(&maxVal))
+        maxVal = (std::numeric_limits<long>::max)();
 
     long out = (value / (long)inc) * (long)inc;
     out = std::clamp(out, (long)minVal, (long)maxVal);
@@ -1512,19 +1524,6 @@ int SaperaGigE::ResizeImageBuffer()
     return DEVICE_OK;
 }
 
-/**
- * Generate an image with fixed value for all pixels
- */
-void SaperaGigE::GenerateImage()
-{
-    const int maxValue = (1 << MAX_BIT_DEPTH) - 1; // max for the 12 bit camera
-    const double maxExp = 1000;
-    double step = maxValue / maxExp;
-    unsigned char* pBuf = const_cast<unsigned char*>(img_.GetPixels());
-    double exposureMs = GetExposure();
-    memset(pBuf, (int)(step * (std::max)(exposureMs, maxExp)), GetImageBufferSize());
-}
-
 /*
  * Reformat Sapera Buffer Object
  */
@@ -1804,9 +1803,13 @@ int SaperaGigE::SetUpBinningProperties()
     }
     AcqDevice_.GetFeatureValue("BinningVertical", &bin);
     AcqDevice_.GetFeatureInfo("BinningVertical", &AcqFeature_);
-    AcqFeature_.GetMin(&min);
-    AcqFeature_.GetMax(&max);
-    AcqFeature_.GetInc(&inc);
+    if (!AcqFeature_.GetMin(&min) || !AcqFeature_.GetMax(&max))
+    {
+        LogMessage("Failed to read 'BinningVertical' min/max");
+        return DEVICE_INVALID_PROPERTY;
+    }
+    if (!AcqFeature_.GetInc(&inc) || inc <= 0)
+        inc = 1;
     for (INT64 i = min; i <= max; i += inc)
         vValues.insert(i);
 
@@ -1818,13 +1821,21 @@ int SaperaGigE::SetUpBinningProperties()
     }
     AcqDevice_.GetFeatureValue("BinningHorizontal", &bin);
     AcqDevice_.GetFeatureInfo("BinningHorizontal", &AcqFeature_);
-    AcqFeature_.GetMin(&min);
-    AcqFeature_.GetMax(&max);
-    AcqFeature_.GetInc(&inc);
+    if (!AcqFeature_.GetMin(&min) || !AcqFeature_.GetMax(&max))
+    {
+        LogMessage("Failed to read 'BinningHorizontal' min/max");
+        return DEVICE_INVALID_PROPERTY;
+    }
+    if (!AcqFeature_.GetInc(&inc) || inc <= 0)
+        inc = 1;
     for (INT64 i = min; i <= max; i += inc)
         hValues.insert(i);
 
-    // possible uniform binning values.
+    // Possible uniform binning values: OnBinning() writes the chosen value to both axes,
+    // so only a value supported by *both* vertical and horizontal binning can succeed --
+    // use the intersection, not the union (a union entry supported by only one axis would
+    // be offered but always fail with DEVICE_ERR, potentially after the other axis was
+    // already changed).
     if (vValues.empty() && hValues.empty())
         binValues.insert(1);
     else if (vValues.empty())
@@ -1832,7 +1843,7 @@ int SaperaGigE::SetUpBinningProperties()
     else if (hValues.empty())
         binValues = vValues;
     else {
-        std::set_union(vValues.begin(), vValues.end(),
+        std::set_intersection(vValues.begin(), vValues.end(),
             hValues.begin(), hValues.end(),
             std::inserter(binValues, binValues.begin()));
     }
